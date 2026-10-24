@@ -262,6 +262,63 @@ python -m torch.distributed.run \
 >
 > The test set is handled differently. Every rank evaluates the complete test set, then rank zero combines the per-rank results and averages them. These repeated evaluations provide a more accurate and stable estimate of test performance without requiring an extensive repeated evaluation of the much larger training set.
 
+### Fast training with a learned world model (SuperMimic)
+
+`G1-BFM-Transformer-Tracking-SuperMimic` trains the same BFM policy as PPO, following [SuperMimic](https://arxiv.org/abs/2610.28480). The policy uses the same humanoid transformer, observations, rewards, terminations and mode masking. Each update does three things:
+
+1. It collects 2.5 simulator steps on average (update-to-data ratio 0.4), with action noise N(0, 0.1²), into a per-environment replay buffer.
+2. It fits a differentiable world model on 8-step autoregressive windows.
+3. It back-propagates the return of 32-step imagined rollouts through the world model into the actor (BPTT). A critic bootstraps the return beyond the horizon and is fitted to λ-returns.
+
+Observations, rewards and soft terminations in imagination are computed analytically from the predicted state, using forward kinematics of the robot MJCF. `scripts/supermimic/check_parity.py` checks them against the simulator. Checkpoints keep the PPO format, so the commands in sections 6 and 7 apply unchanged.
+
+**Prepare the data.** Build the flat-ground train/eval YAML files (BONES-SEED filtered with the paper's rules, any4hdmi, LAFAN1). Pack each file into a memory-mappable motion library, so that ~140k clips load in seconds instead of decompressing every `.npz` at start-up:
+
+```bash
+python scripts/pretrain/data_process/build_supermimic_manifest.py \
+  --datasets_root /path/to/datasets --output_dir /path/to/supermimic_flat
+python scripts/pretrain/data_process/pack_motion_library.py \
+  --motion_file /path/to/supermimic_flat/train.yaml --output_dir /dev/shm/sm_lib/train
+python scripts/pretrain/data_process/pack_motion_library.py \
+  --motion_file /path/to/supermimic_flat/eval.yaml --output_dir /dev/shm/sm_lib/eval
+# Optional: remove LAFAN clips whose test segments are in the eval set
+python scripts/pretrain/data_process/split_lafan_holdout.py \
+  --train_library /dev/shm/sm_lib/train --eval_library /dev/shm/sm_lib/eval \
+  --train_manifest /path/to/supermimic_flat/train.yaml --output_dir /path/to/holdout
+```
+
+**Train.** For this task, `--motion_file` and `--test_motion_file` take packed library directories. Multi-GPU launching works as above:
+
+```bash
+python -m torch.distributed.run --nnodes 1 --nproc_per_node "${GPUS_PER_NODE}" \
+  scripts/pretrain/rsl_rl/train.py \
+  --task G1-BFM-Transformer-Tracking-SuperMimic \
+  --motion_file /dev/shm/sm_lib/train \
+  --test_motion_file /dev/shm/sm_lib/eval \
+  --run_name my_supermimic_run --logger tensorboard --distributed --headless \
+  agent.supermimic.cuda_graph=true \
+  agent.supermimic.budget_mode=hours agent.supermimic.max_train_hours=2.75 \
+  agent.supermimic.eval_interval_updates=1000
+```
+
+The main options are in `agents/rsl_rl_supermimic_cfg.py`:
+
+| Option | Meaning |
+|---|---|
+| `budget_mode`, `max_train_hours` / `max_iterations` | Training budget, in wall-clock hours or in updates. The learning rate follows a cosine decay to 0.03× over the first 78% of the policy phase, then stays constant. Choose a budget that the run actually reaches; otherwise the decay never happens. |
+| `cuda_graph` | Replays the actor pass (imagination forward and backward) as one CUDA graph. |
+| `imagination_batch_size`, `wm_batch_size` | Imagined rollouts and world-model windows per GPU. |
+| `actor_checkpointing`, `actor_micro_batch_size` | Memory savers for large batches on small GPUs. |
+| `lr_scale_with_world_size` | Scales the learning rates by √(number of GPUs), as in the paper. |
+| `eval_interval_updates` / `eval_interval_minutes` | Test-set evaluation and checkpointing period. |
+
+**Speed.** The imagination is fused with `torch.compile`, but it is still launch bound. On an RTX 5090, one policy update contains 0.19 s of GPU kernels within 0.64 s of wall time. `cuda_graph=true` removes that host overhead. Two environment variables help further:
+
+- `SCALETRACK_COMPILE_CACHE_DIR` stores the compiled artifacts per GPU, keyed by source code, configuration and shapes, so that later jobs skip the ~10 min compilation.
+- `SCALETRACK_NCCL_LIB` preloads a newer NCCL. With the NCCL bundled with Isaac Sim, more than 2 ranks hit illegal memory accesses on RTX 5090.
+
+Compared with PPO (17.0 s per iteration on 8 RTX 5090), a SuperMimic training step with the CUDA graph takes 0.65 s (16 RTX 5090): **26× faster per training step**.
+
 ## 🎮 6. Play a policy
 
 Load a saved checkpoint and replay a motion set in simulation:

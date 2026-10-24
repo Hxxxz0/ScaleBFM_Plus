@@ -7,6 +7,15 @@
 
 """Launch Isaac Sim Simulator first."""
 
+import os
+
+# Optionally preload another NCCL before torch is imported (RTX 5090: the NCCL 2.26 bundled with torch 2.7 raises
+# illegal memory accesses with more than 2 ranks). /isaac-sim/python.sh overwrites LD_PRELOAD, so use ctypes.
+if os.environ.get("SCALETRACK_NCCL_LIB"):
+    import ctypes
+
+    ctypes.CDLL(os.environ["SCALETRACK_NCCL_LIB"], mode=ctypes.RTLD_GLOBAL)
+
 import argparse
 import sys
 
@@ -60,6 +69,7 @@ from isaaclab.envs import (
     multi_agent_to_single_agent,
 )
 from isaaclab.utils.dict import print_dict
+from isaaclab.utils.io import dump_yaml
 from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper
 from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
@@ -68,6 +78,8 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 import scaletrack.tasks  # noqa: F401
 
 from my_rsl_rl.runners.on_policy_runner import OnPolicyRunner
+from my_rsl_rl.runners.supermimic_runner import SuperMimicRunner
+from my_rsl_rl.runners.ppo_benchmark_runner import PPOBenchmarkRunner
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -90,8 +102,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.seed = agent_cfg.seed
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
 
-    env_cfg.commands.motion.motion_file = args_cli.motion_file
-    env_cfg.commands.motion.test_motion_file = args_cli.test_motion_file
+    if hasattr(env_cfg.commands.motion, "motion_lib_dir"):
+        # SuperMimic tasks read packed motion libraries (directories made by pack_motion_library.py)
+        env_cfg.commands.motion.motion_lib_dir = args_cli.motion_file
+        env_cfg.commands.motion.test_motion_lib_dir = args_cli.test_motion_file
+    else:
+        env_cfg.commands.motion.motion_file = args_cli.motion_file
+        env_cfg.commands.motion.test_motion_file = args_cli.test_motion_file
 
     # multi-gpu training configuration
     if args_cli.distributed:
@@ -99,7 +116,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         agent_cfg.device = f"cuda:{app_launcher.local_rank}"
 
         # set seed to have diversity in different threads
-        seed = agent_cfg.seed + app_launcher.local_rank
+        seed = agent_cfg.seed + app_launcher.global_rank
         env_cfg.seed = seed
         agent_cfg.seed = seed
 
@@ -111,6 +128,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # weishuai: We init communication at the very beginning instead of the runner as the initialization of some environment components may need sync.
         torch.distributed.init_process_group(backend="nccl", rank=gpu_global_rank, world_size=gpu_world_size)
         torch.cuda.set_device(gpu_local_rank)
+        print(
+            f"[distributed] rank={gpu_global_rank}/{gpu_world_size} local_rank={gpu_local_rank} "
+            f"seed={seed} num_envs={env_cfg.scene.num_envs}",
+            flush=True,
+        )
 
     # specify directory for logging experiments
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
@@ -145,9 +167,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env = RslRlVecEnvWrapper(env)
 
     # create runner from rsl-rl
-    runner = OnPolicyRunner(
+    runner_class = {
+        "SuperMimicRunner": SuperMimicRunner,
+        "PPOBenchmarkRunner": PPOBenchmarkRunner,
+        "OnPolicyRunner": OnPolicyRunner,
+    }[agent_cfg.class_name]
+    runner = runner_class(
         env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device
     )
+    if not args_cli.distributed or gpu_global_rank == 0:
+        dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
+        dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
     # write git state to logs
     runner.add_git_repo_to_log(__file__)
     # save resume path before creating a new log_dir

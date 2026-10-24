@@ -92,6 +92,11 @@ def randomize_rigid_body_com(
     # Set the new coms
     asset.root_physx_view.set_coms(coms, env_ids)
 
+    # keep the sampled offsets (read by the SuperMimic simulation context)
+    if not hasattr(asset.data, "com_offset_randomization"):
+        asset.data.com_offset_randomization = torch.zeros(env.scene.num_envs, 3)
+    asset.data.com_offset_randomization[env_ids] = rand_samples[:, 0]
+
 def push_by_setting_velocity_customized(
     env: ManagerBasedEnv,
     env_ids: torch.Tensor,

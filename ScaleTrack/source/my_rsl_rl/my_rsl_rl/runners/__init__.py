@@ -6,5 +6,6 @@
 """Implementation of runners for environment-agent interaction."""
 
 from .on_policy_runner import OnPolicyRunner  # noqa: I001
+from .supermimic_runner import SuperMimicRunner
 
-__all__ = ["OnPolicyRunner"]
+__all__ = ["OnPolicyRunner", "SuperMimicRunner"]

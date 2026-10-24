@@ -106,11 +106,15 @@ class HumanoidTransformerBlock(nn.Module):
         
         self.rope = RoPEPositionalEncoding(embed_dim)
 
+        # Returning attention weights disables the fused attention kernels; training through long imagined
+        # rollouts turns it off. Exported graphs keep the default.
+        self.need_weights = True
+
     def forward(self, x, c, self_attn_mask = None):
         
         x_norm = self.rmsnorm1(x)
         x_rope = self.rope(x_norm)
-        attn_output, _ = self.self_attention(x_rope, x_rope, x_norm, attn_mask=self_attn_mask)
+        attn_output, _ = self.self_attention(x_rope, x_rope, x_norm, attn_mask=self_attn_mask, need_weights=self.need_weights)
         x = x + attn_output
 
         x_norm2 = self.rmsnorm2(x)
@@ -118,7 +122,8 @@ class HumanoidTransformerBlock(nn.Module):
         cross_output, _ = self.cross_attention(
             query=x_norm2,
             key=c_norm,
-            value=c_norm
+            value=c_norm,
+            need_weights=self.need_weights,
         )
         x = x + cross_output
 

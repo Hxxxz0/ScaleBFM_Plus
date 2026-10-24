@@ -33,6 +33,7 @@ class PPO:
         use_clipped_value_loss: bool = True,
         schedule: str = "adaptive",
         desired_kl: float = 0.01,
+        forward_micro_batch_size: int = 0,
         device: str = "cpu",
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
@@ -40,6 +41,9 @@ class PPO:
     ) -> None:
         # Device-related parameters
         self.device = device
+        if forward_micro_batch_size < 0:
+            raise ValueError("forward_micro_batch_size must be nonnegative")
+        self.forward_micro_batch_size = forward_micro_batch_size
         self.is_multi_gpu = multi_gpu_cfg is not None
 
         # Multi-GPU parameters
@@ -133,6 +137,10 @@ class PPO:
         )
 
     def update(self) -> dict[str, float]:
+        if self.forward_micro_batch_size:
+            from .ppo_microbatch import update
+
+            return update(self)
         mean_value_loss = 0
         mean_surrogate_loss = 0
         mean_entropy = 0

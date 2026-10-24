@@ -193,6 +193,27 @@ class ActorCriticHumanoidTransformer(nn.Module):
             mean = self.actor(actor_prop_obs, actor_action_obs, actor_task_tokens)
         return mean
 
+    def actor_mean_from_parts(
+        self,
+        prop_obs: torch.Tensor,
+        task_obs: torch.Tensor,
+        action_obs: torch.Tensor,
+        mode: torch.Tensor,
+        mode_mapping: torch.Tensor,
+    ) -> torch.Tensor:
+        """Deterministic action of the training-mode (masked) actor from separate, differentiable inputs.
+
+        Same computation as ``get_actor_obs`` + ``act_inference`` with ``inference=False``, but without in-place
+        operations so it can be back-propagated through (prop_obs (N, C, P), task_obs (N, F, T), action_obs
+        (N, C, A), mode (N, M), mode_mapping (N, T)).
+        """
+        task_obs = task_obs * mode_mapping.unsqueeze(-2)
+        task_obs = torch.cat([task_obs, mode.unsqueeze(-2).expand(-1, task_obs.shape[-2], -1)], dim=-1)
+        out = self.actor(prop_obs, action_obs, self.actor_task_embedder(task_obs))
+        if self.state_dependent_std:
+            out = torch.chunk(out, 2, dim=-1)[0]
+        return out
+
     def evaluate(self, obs: TensorDict, **kwargs: dict[str, Any]) -> torch.Tensor:
         prop_obs, task_obs, action_obs = self.get_critic_obs(obs)
         if self.use_transformer_critic:

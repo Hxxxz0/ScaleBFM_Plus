@@ -17,6 +17,7 @@ class CompleteRslRlPpoActorCriticTransformerCfg(CompleteRslRlPpoActorCriticCfg):
 
 @configclass
 class CompleteRslRlPpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
+    forward_micro_batch_size: int = 0
     actor_learning_rate: float = 2.0e-5
     critic_learning_rate: float = 1.0e-3
 
