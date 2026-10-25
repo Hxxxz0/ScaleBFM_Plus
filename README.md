@@ -42,8 +42,8 @@ pipeline. It packages retargeted robot trajectories into motion datasets and
 pretrains BFMs through motion tracking in IsaacLab using the bundled RSL-RL
 implementation. It currently provides a complete pretraining pipeline for the
 Unitree G1 humanoid, including single- and multi-GPU training, policy playback, and export.
-Besides PPO, it supports SuperMimic-style training through a learned differentiable world model, which needs
-far less wall-clock time for the same tracking quality (see
+Besides PPO, it supports SuperMimic-style training through a learned differentiable world model: each training
+step is 26× faster, and the released SuperMimic checkpoint tracks on par with the official ScaleBFM-M (see
 [Fast training with a learned world model](ScaleTrack/README.md#fast-training-with-a-learned-world-model-supermimic)).
 
 The training code and documentation are available in

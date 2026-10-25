@@ -319,6 +319,21 @@ The main options are in `agents/rsl_rl_supermimic_cfg.py`:
 
 Compared with PPO (17.0 s per iteration on 8 RTX 5090), a SuperMimic training step with the CUDA graph takes 0.65 s (16 RTX 5090): **26× faster per training step**.
 
+**Results.** Trained for 8.3 h on 16 RTX 5090, the SuperMimic policy tracks **on par with the official ScaleBFM-M checkpoint**, with the same architecture. It tracks 99.5% of the 2,575 held-out test motions (BONES-SEED, any4hdmi, LAFAN1). In side-by-side playback (same simulator, motion, seed and camera), the mean global body-position errors are:
+
+<p align="center">
+  <img src="assets/demos/supermimic_vs_official.gif" alt="Official ScaleBFM-M (left) and SuperMimic (right) tracking an unseen LAFAN dance" width="80%">
+</p>
+
+| Unseen test motion | Official ScaleBFM-M | SuperMimic |
+|---|---:|---:|
+| BONES hip-hop | 8.8 cm | **6.4 cm** |
+| LAFAN dance | 5.1 cm | 5.1 cm |
+| LAFAN run | **7.5 cm** | 9.1 cm |
+| LAFAN walk | **4.7 cm** | 5.9 cm |
+
+The checkpoint is released in `checkpoints/supermimic_m/`: `model_43000.pt` (PPO format, policy and optimizer states only), the exported `model_43000.onnx`, `mode_table.pt` and the export metadata. Copy the folder to `logs/rsl_rl/g1_bfm_tracking_exp/supermimic_m` and use `--load_run supermimic_m --checkpoint model_43000.pt` with the commands of sections 6 and 7.
+
 ## 🎮 6. Play a policy
 
 Load a saved checkpoint and replay a motion set in simulation:
@@ -423,6 +438,8 @@ python scripts/pretrain/rsl_rl/play_export_check_humanoid_transformer.py \
 Add `--headless` to export and run the simulator comparison without opening the Isaac Sim GUI.
 
 The script writes `mode_table.pt`, `<checkpoint>_tensorrt.pt`, and `<checkpoint>_tensorrt_metadata.json` beside the loaded checkpoint under `logs/rsl_rl/<experiment>/<load_run>/`.
+
+Add `--export_format onnx` to export a portable `<checkpoint>.onnx` (with `<checkpoint>_onnx_metadata.json`) instead. It has the same inputs and outputs as the TensorRT module, and the simulator check runs it with `onnxruntime`.
 
 
 #### Export the provided humanoid_transformer_m

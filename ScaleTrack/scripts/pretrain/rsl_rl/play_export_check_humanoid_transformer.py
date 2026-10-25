@@ -27,6 +27,12 @@ parser.add_argument(
 parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument("--motion_file", type=str, default=None, help="Path to the motion file.")
+parser.add_argument(
+    "--export_format",
+    choices=["tensorrt", "onnx"],
+    default="tensorrt",
+    help="TensorRT module for this machine, or a portable ONNX model (checked with onnxruntime).",
+)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -44,6 +50,7 @@ app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
 """Rest everything follows."""
+import copy
 import time
 import math
 import gymnasium as gym
@@ -54,7 +61,6 @@ import pathlib
 import torch
 import numpy as np
 import torch.nn as nn
-import torch_tensorrt
 import xml.etree.ElementTree as ET
 
 from my_rsl_rl.runners.on_policy_runner import OnPolicyRunner
@@ -324,6 +330,34 @@ class HumanoidTransformerPolicyWrapperWithMode(nn.Module):
         # Return Direct PD target and action for buffer
         return action * self.action_scale + self.default_dof_pos, action
 
+
+ONNX_INPUT_NAMES = [
+    "root_quat_buffer",
+    "base_ang_vel_buffer",
+    "dof_pos_buffer",
+    "dof_vel_buffer",
+    "last_action_buffer",
+    "target_body_pos_future",
+    "target_body_rot_future",
+    "mode_index",
+    "time_offsets",
+]
+
+
+class OnnxPolicy:
+    """Run the exported ONNX model with onnxruntime behind the same call signature as the TensorRT module."""
+
+    def __init__(self, path: str):
+        import onnxruntime
+
+        self.session = onnxruntime.InferenceSession(path, providers=["CPUExecutionProvider"])
+        self.input_names = [i.name for i in self.session.get_inputs()]
+
+    def __call__(self, *inputs: torch.Tensor) -> list[torch.Tensor]:
+        feeds = {name: x.detach().cpu().numpy() for name, x in zip(ONNX_INPUT_NAMES, inputs) if name in self.input_names}
+        return [torch.from_numpy(y).to(inputs[0].device) for y in self.session.run(None, feeds)]
+
+
 def build_mode_mappings(
     mode_table: torch.Tensor,
     feature_dims_per_link,
@@ -448,8 +482,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     log_dir = os.path.dirname(resume_path)
     checkpoint_stem = pathlib.Path(resume_path).stem
     mode_table_path = os.path.join(log_dir, "mode_table.pt")
-    tensorrt_model_path = os.path.join(log_dir, f"{checkpoint_stem}_tensorrt.pt")
-    tensorrt_metadata_path = os.path.join(log_dir, f"{checkpoint_stem}_tensorrt_metadata.json")
+    model_suffix = "_tensorrt.pt" if args_cli.export_format == "tensorrt" else ".onnx"
+    model_path = os.path.join(log_dir, f"{checkpoint_stem}{model_suffix}")
+    metadata_path = os.path.join(log_dir, f"{checkpoint_stem}_{args_cli.export_format}_metadata.json")
 
     # wrap for video recording
     if args_cli.video:
@@ -547,12 +582,26 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             time_offsets
         ]
 
-        trt_module = torch_tensorrt.compile(
-            wrapper,
-            ir="dynamo",
-            inputs=trt_inputs,
-        )
-        torch_tensorrt.save(trt_module, tensorrt_model_path, output_format="torchscript", inputs=trt_inputs)
+        if args_cli.export_format == "tensorrt":
+            import torch_tensorrt
+
+            trt_module = torch_tensorrt.compile(
+                wrapper,
+                ir="dynamo",
+                inputs=trt_inputs,
+            )
+            torch_tensorrt.save(trt_module, model_path, output_format="torchscript", inputs=trt_inputs)
+        else:
+            # Traced on a CPU copy: ONNX constant folding cannot mix devices, and the policy stays on the GPU.
+            torch.onnx.export(
+                copy.deepcopy(wrapper).cpu(),
+                tuple(x.cpu() for x in trt_inputs),
+                model_path,
+                input_names=ONNX_INPUT_NAMES,
+                output_names=["joint_pos_target", "action"],
+                opset_version=17,
+                dynamo=False,
+            )
         
         stiffness_dict = {}
         damping_dict = {}
@@ -628,14 +677,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             "damping": damping_list,
             "torque_limit": torque_limit_list
         }
-        with open(tensorrt_metadata_path, "w") as f:
+        with open(metadata_path, "w") as f:
             json.dump(metadata, f, indent=4)
 
     print(f"[INFO]: Saved mode table to: {mode_table_path}")
-    print(f"[INFO]: Saved TensorRT model to: {tensorrt_model_path}")
-    print(f"[INFO]: Saved TensorRT metadata to: {tensorrt_metadata_path}")
+    print(f"[INFO]: Saved {args_cli.export_format} model to: {model_path}")
+    print(f"[INFO]: Saved {args_cli.export_format} metadata to: {metadata_path}")
 
-    model = torch.jit.load(tensorrt_model_path).to(mode_vector.device)
+    if args_cli.export_format == "tensorrt":
+        model = torch.jit.load(model_path).to(mode_vector.device)
+    else:
+        model = OnnxPolicy(model_path)
     mode_index = torch.tensor([7], dtype=torch.long, device=mode_vector.device)
 
     root_pos = env.unwrapped.command_manager.get_term('motion').robot_anchor_pos_w
