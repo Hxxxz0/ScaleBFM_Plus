@@ -319,7 +319,7 @@ The main options are in `agents/rsl_rl_supermimic_cfg.py`:
 
 Compared with PPO (17.0 s per iteration on 8 RTX 5090), a SuperMimic training step with the CUDA graph takes 0.65 s (16 RTX 5090): **26× faster per training step**.
 
-**Results.** Trained for 8.3 h on 16 RTX 5090, the SuperMimic policy tracks **on par with the official ScaleBFM-M checkpoint**, with the same architecture. It tracks 99.5% of the 2,575 held-out test motions (BONES-SEED, any4hdmi, LAFAN1). In side-by-side playback (same simulator, motion, seed and camera), the mean global body-position errors are:
+**Results.** The training set has **309 h of motion** (138k clips: 254 h BONES-SEED, 52 h any4hdmi, 2 h LAFAN1), 17% more than the 265 h BONES-SEED subset used by SuperMimic. Trained for 8.3 h on 16 RTX 5090, the SuperMimic policy tracks **on par with the official ScaleBFM-M checkpoint**, with the same architecture. It tracks 99.5% of the 2,575 held-out test motions (BONES-SEED, any4hdmi, LAFAN1). On the 386 most dynamic test motions (dance, jumps, sprints, spins, fights), both checkpoints succeed on 376, with mean global body-position errors of 6.35 cm (SuperMimic) and 6.43 cm (official). In side-by-side playback (same simulator, motion, seed and camera), the mean global body-position errors are:
 
 <p align="center">
   <img src="assets/demos/supermimic_vs_official.gif" alt="Official ScaleBFM-M (left) and SuperMimic (right) tracking an unseen LAFAN dance" width="80%">
