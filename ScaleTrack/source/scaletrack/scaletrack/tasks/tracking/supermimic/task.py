@@ -41,17 +41,26 @@ class TrackingImaginationTask:
         self.lib = self.command.train_lib
         cfg = heads_cfg or HeadsCfg()
         cfg.step_dt = env.step_dt
-        self.spec = StateSpec(spec_cfg or StateSpecCfg(dt=env.step_dt), self.device)
+        self.spec = StateSpec(spec_cfg or StateSpecCfg(dt=env.step_dt), self.device, num_joints=len(self.robot.joint_names))
+        self.state_dim = self.spec.state_dim
 
         data = self.robot.data
-        kin = HumanoidKinematics(str(xml_path or ASSET_XML), self.robot.joint_names, self.command.cfg.body_names, self.device)
+        kin = HumanoidKinematics(str(xml_path or getattr(env.cfg, "robot_xml", None) or ASSET_XML), self.robot.joint_names, self.command.cfg.body_names, self.device)
         q0 = getattr(data, "default_joint_pos_nominal", data.default_joint_pos[0]).clone()
         self.heads = TrackingHeads(cfg, kin, q0, data.soft_joint_pos_limits[0].clone(), self.command._mode_table.clone())
+        # The simulator's finger joint tracking term (G1 + Inspire), if configured, is imagined with the same parameters.
+        term = getattr(env.cfg.rewards, "motion_finger_joint", None)
+        if term is not None:
+            ids = self.robot.find_joints(term.params["asset_cfg"].joint_names)[0]
+            ids = torch.tensor(ids, dtype=torch.long, device=self.device)
+            self.heads.joint_reward = ("motion_finger_joint", ids, float(term.weight), float(term.params["std"]))
+            self.reward_term_names = self.reward_term_names + ("motion_finger_joint",)
         self.policy_offsets = torch.tensor(cfg.policy_future_idx, device=self.device)
         self.critic_offsets = torch.tensor(cfg.critic_future_idx, device=self.device)
 
         # Fixed per-environment quantities (all randomisation happens at start-up).
         self.xi = read_sim_context(self.robot, self.device)
+        self.xi_dim = self.xi.shape[-1]
         self.xi_norm = normalize_xi(self.xi)
         self.joint_offset = data.default_joint_pos - q0
         self.com_pos_b = self.robot.root_physx_view.get_coms().to(self.device)[:, self.command.body_indexes, :3].clone()
@@ -92,6 +101,7 @@ class TrackingImaginationTask:
             lib.body_quat_w[frames],
             lib.body_lin_vel_w[frames] if with_vel else None,
             lib.body_ang_vel_w[frames] if with_vel else None,
+            lib.joint_pos[frames] if with_vel and self.heads.joint_reward is not None else None,
         )
 
     def bodies(self, s: torch.Tensor, ctx: dict[str, torch.Tensor], with_vel: bool = True) -> dict[str, torch.Tensor]:
@@ -101,7 +111,7 @@ class TrackingImaginationTask:
         obs = self.heads.prop_obs(s, ctx["joint_offset"])
         return self.heads.add_prop_noise(obs) if noise else obs
 
-    def policy_task_obs(self, bodies: dict, frame: torch.Tensor, roff: torch.Tensor, noise: bool) -> torch.Tensor:
+    def policy_task_obs(self, bodies: dict, frame: torch.Tensor, roff: torch.Tensor, noise: bool, s=None) -> torch.Tensor:
         offsets = torch.where(self.policy_offsets < 0, roff[:, None], self.policy_offsets[None, :])
         ref = self.reference(self.lib.future(frame, offsets), with_vel=False)
         obs = self.heads.task_obs(bodies, ref, offsets)
@@ -110,7 +120,11 @@ class TrackingImaginationTask:
     def mode_inputs(self, mode_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return self.heads.mode(mode_ids), self.heads.mode_mapping(mode_ids)
 
-    def transition(self, s_next, bodies_next, action, prev_action, frame) -> dict[str, torch.Tensor]:
+    def env_task_obs(self, obs) -> torch.Tensor:
+        """Policy-task input of the actor from an environment observation dict (the form policy_task_obs returns)."""
+        return obs["policy_task"]
+
+    def transition(self, s_next, bodies_next, action, prev_action, frame, s_prev=None) -> dict[str, torch.Tensor]:
         """Reward, soft termination and truncation of the transition into s_next tracked against ``frame``."""
         ref = self.reference(frame)
         done = self.heads.soft_termination(bodies_next, ref)
@@ -130,7 +144,7 @@ class TrackingImaginationTask:
 
     @property
     def critic_dim(self) -> int:
-        return self.spec.in_scale.shape[0] + XI_DIM + self.heads.num_bodies + len(self.critic_offsets) * (
+        return self.spec.in_scale.shape[0] + self.xi_dim + self.heads.num_bodies + len(self.critic_offsets) * (
             self.heads.num_bodies * (3 + 3 + 6 + 6 + 3 + 3) + 1
         )
 

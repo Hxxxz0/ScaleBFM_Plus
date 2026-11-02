@@ -23,7 +23,7 @@ class SuperMimicTrackingEnv(ManagerBasedRLEnv):
         self._motion_reset_context = None
         self._explicit_reset = False
         super().__init__(cfg, render_mode, **kwargs)
-        self.terminal_state = torch.zeros(self.num_envs, STATE_DIM, device=self.device)
+        self.terminal_state = torch.zeros_like(self._read_terminal_state(slice(None)))
 
     def make_imagination_task(self, **kwargs):
         """Imagination interface used by my_rsl_rl's SuperMimicRunner."""
@@ -33,14 +33,14 @@ class SuperMimicTrackingEnv(ManagerBasedRLEnv):
 
     def _reset_idx(self, env_ids: Sequence[int]):
         if self.terminal_state is not None:
-            self.terminal_state[env_ids] = read_state(self.scene["robot"], self.scene.env_origins, env_ids)
+            self.terminal_state[env_ids] = self._read_terminal_state(env_ids)
             command = self.command_manager.get_term("motion")
             if command.reset_sampler is not None and not self._explicit_reset and not command.is_evaluating:
                 self._motion_reset_context = ResetContext(
                     command.motion_ids[env_ids].clone(),
                     command.time_steps[env_ids].clone(),
                     self.episode_length_buf[env_ids].clone(),
-                    self.termination_manager.get_term("body_pos")[env_ids].clone(),
+                    self._failed(env_ids).clone(),
                     (
                         self.termination_manager.get_term("time_out")[env_ids]
                         | self.termination_manager.get_term("motion_time_out")[env_ids]
@@ -50,6 +50,13 @@ class SuperMimicTrackingEnv(ManagerBasedRLEnv):
             super()._reset_idx(env_ids)
         finally:
             self._motion_reset_context = None
+
+    def _read_terminal_state(self, env_ids) -> torch.Tensor:
+        return read_state(self.scene["robot"], self.scene.env_origins, env_ids)
+
+    def _failed(self, env_ids) -> torch.Tensor:
+        """Episodes that ended by a tracking failure (the reset context of failure retries)."""
+        return self.termination_manager.get_term("body_pos")[env_ids]
 
     def reset(self, seed=None, env_ids=None, options=None):
         """Explicit resets must not reuse terminal flags from the previous step."""

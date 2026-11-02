@@ -49,7 +49,8 @@ def randomize_joint_default_pos(
             env_ids = env_ids[:, None]
         asset.data.default_joint_pos[env_ids, joint_ids] = pos
         # update the offset in action since it is not updated automatically
-        env.action_manager.get_term("joint_pos")._offset[env_ids, joint_ids] = pos
+        action_term = env.action_manager.get_term("joint_pos")
+        action_term._offset = asset.data.default_joint_pos[:, action_term._joint_ids].clone()
 
 
 def randomize_rigid_body_com(

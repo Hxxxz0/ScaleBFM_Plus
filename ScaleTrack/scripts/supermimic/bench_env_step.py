@@ -25,6 +25,8 @@ from isaaclab_tasks.utils import parse_env_cfg
 
 cfg = parse_env_cfg(args.task, device=args.device, num_envs=args.num_envs)
 cfg.commands.motion.motion_file = args.motion_file
+if hasattr(cfg.commands.motion, "motion_lib_dir"):
+    cfg.commands.motion.motion_lib_dir = args.motion_file
 if args.no_critic_obs:
     cfg.observations.critic = None
     cfg.observations.critic_task = None

@@ -3,6 +3,11 @@
 Compiling the imagination graphs takes ~10 minutes on every fresh node. The artifacts are saved once per
 (torch version, GPU architecture and index, compiled source code, tensor shapes) key and hot-loaded by later jobs, so
 that only Dynamo tracing (seconds) remains.
+
+A source edit changes the key, but the artifacts are content addressed (graph hashes): a miss is seeded with the
+latest artifacts of the same configuration (``<lineage>.latest``), or of the code trees listed in
+``SCALETRACK_COMPILE_CACHE_FROM_CODE`` (colon separated roots of earlier code copies), so that only the graphs whose
+code changed are compiled again.
 """
 
 from __future__ import annotations
@@ -25,22 +30,40 @@ def source_digest(*directories: str | Path) -> str:
     return digest.hexdigest()
 
 
+def _name(key: dict) -> str:
+    return hashlib.sha256(json.dumps(key, sort_keys=True, default=str).encode()).hexdigest()[:20]
+
+
 class CompileCache:
-    def __init__(self, directory: str | Path | None, key: dict):
+    def __init__(self, directory: str | Path | None, key: dict, sources: tuple[Path, ...] = (), root: Path | None = None):
+        """``sources``: directories whose Python code is compiled; ``root``: the code tree that contains them."""
         self.path = None
+        self.loaded: Path | None = None
         if directory:
+            directory = Path(directory)
             # Compiled kernels are specialised to the device index: every local rank keeps its own entry.
             key = dict(
                 key, torch=torch.__version__, capability=torch.cuda.get_device_capability(), device=torch.cuda.current_device()
             )
-            name = hashlib.sha256(json.dumps(key, sort_keys=True, default=str).encode()).hexdigest()[:20]
-            self.path = Path(directory) / f"{name}.bin"
+            self.path = directory / f"{_name(dict(key, source=source_digest(*sources)))}.bin"
+            self.pointer = directory / f"{_name(key)}.latest"
+            self.fallbacks = []
+            for old_root in filter(None, os.environ.get("SCALETRACK_COMPILE_CACHE_FROM_CODE", "").split(":")):
+                old_sources = [Path(old_root) / Path(d).resolve().relative_to(root) for d in sources]
+                self.fallbacks.append(directory / f"{_name(dict(key, source=source_digest(*old_sources)))}.bin")
 
     def load(self) -> bool:
-        if self.path is None or not self.path.is_file():
+        if self.path is None:
             return False
-        torch.compiler.load_cache_artifacts(self.path.read_bytes())
-        return True
+        candidates = [self.path]
+        if self.pointer.is_file():
+            candidates.append(self.path.with_name(self.pointer.read_text().strip()))
+        for path in candidates + self.fallbacks:
+            if path.is_file():
+                torch.compiler.load_cache_artifacts(path.read_bytes())
+                self.loaded = path
+                return True
+        return False
 
     def save(self) -> bool:
         """Write the artifacts compiled so far, unless an entry for this key exists already."""
@@ -53,4 +76,7 @@ class CompileCache:
         temporary = self.path.with_suffix(f".{os.getpid()}.tmp")
         temporary.write_bytes(artifacts[0])
         temporary.replace(self.path)
+        temporary = self.pointer.with_suffix(f".{os.getpid()}.tmp")
+        temporary.write_text(self.path.name)
+        temporary.replace(self.pointer)
         return True

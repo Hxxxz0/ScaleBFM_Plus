@@ -12,6 +12,9 @@ import torch
 from pathlib import Path
 
 FIELDS = ("joint_pos", "joint_vel", "body_pos_w", "body_quat_w", "body_lin_vel_w", "body_ang_vel_w")
+# Optional per-frame arrays of libraries with one dynamic object per motion (HOI): the object reference (zeros and
+# the identity for motions without an object) and the frames an episode may start from.
+OBJECT_FIELDS = ("object_pos_w", "object_quat_w", "object_lin_vel_w", "object_ang_vel_w", "start_ok")
 
 
 def shard_motions(lengths: np.ndarray, rank: int, world_size: int, seed: int = 0) -> np.ndarray:
@@ -63,6 +66,30 @@ class MotionLibrary:
         for k in FIELDS:
             arr = np.load(lib_dir / f"{k}.npy", mmap_mode="r")
             setattr(self, k, torch.from_numpy(np.ascontiguousarray(arr[rows])).to(self.device))
+        self.has_objects = (lib_dir / "object_pos_w.npy").exists()
+        if self.has_objects:
+            for k in OBJECT_FIELDS:
+                arr = np.load(lib_dir / f"{k}.npy", mmap_mode="r")
+                setattr(self, k, torch.from_numpy(np.ascontiguousarray(arr[rows])).to(self.device))
+            # Per motion: which object (index into ``object_names``, -1: none) and the local frame its evaluation
+            # starts from (the audited start). Single-object libraries only list ``object_valid``.
+            if "object_ids" in index:
+                ids = np.asarray(index["object_ids"], dtype=np.int64)
+                self.object_names = list(index["object_names"])
+            else:
+                ids = np.where(np.asarray(index["object_valid"], dtype=bool), 0, -1)
+                self.object_names = [index.get("object_name", "object")]
+            self.object_id = torch.tensor(ids[motions], device=self.device)
+            self.object_valid = self.object_id >= 0
+            self.eval_start = torch.tensor(np.asarray(index["eval_start"], dtype=np.int64)[motions], device=self.device)
+        # Reference contact labels (add_contact_labels.py sidecar): (frames, B) int8, +1 / -1 / 0 per body.
+        self.has_contact_labels = (lib_dir / "contact_labels.npy").exists()
+        if self.has_contact_labels:
+            meta = json.loads((lib_dir / "contact_labels.json").read_text())
+            self.contact_body_names = list(meta["body_names"])
+            arr = np.load(lib_dir / "contact_labels.npy", mmap_mode="r")
+            self.contact_labels = torch.from_numpy(np.ascontiguousarray(arr[rows])).to(self.device)
+            self.contact_valid = torch.tensor(np.asarray(meta["valid"], dtype=bool)[motions], device=self.device)
 
         self.num_motions = len(motions)
         self.num_frames = int(lengths.sum())
@@ -85,6 +112,32 @@ class MotionLibrary:
         )
         frame_local = torch.arange(self.num_frames, device=self.device) - self.starts[self.frame_motion]
         self.frame_bin = first_bin[self.frame_motion] + frame_local // bin_frames
+        if self.has_objects:
+            self.frame_object_valid = self.object_valid[self.frame_motion].float()
+            self.bin_object = self.object_id[self.bin_motion]
+            # Allowed start frames grouped by bin, for sampling a start uniformly among the allowed frames of a bin.
+            ok = torch.nonzero(self.start_ok).squeeze(-1)
+            self.ok_frames = ok
+            self.bin_ok_count = torch.zeros(self.num_bins, dtype=torch.long, device=self.device).index_add_(
+                0, self.frame_bin[ok], torch.ones_like(ok)
+            )
+            self.bin_ok_start = torch.cumsum(self.bin_ok_count, 0) - self.bin_ok_count
+
+    def contact_token(self, frame: torch.Tensor, offsets: torch.Tensor, num_bodies: int) -> torch.Tensor:
+        """(N, 1, 1, F*B + 1) reference contact labels at frame + offsets (F) with the motion's label validity last;
+        zero and invalid for motions (or libraries) without labels."""
+        valid = torch.zeros(frame.shape[0], 1, device=frame.device)
+        if not self.has_contact_labels:
+            return torch.cat([torch.zeros(frame.shape[0], offsets.shape[-1] * num_bodies, device=frame.device), valid], -1)[:, None, None]
+        valid = self.contact_valid[self.frame_motion[frame]].float()[:, None]
+        labels = self.contact_labels[self.future(frame, offsets.expand(frame.shape[0], -1))].float().flatten(1)
+        return torch.cat([labels * valid, valid], -1)[:, None, None]
+
+    def contact_labels_at(self, frame: torch.Tensor, cols: torch.Tensor) -> torch.Tensor:
+        """(N, L) labels of the label columns ``cols`` at ``frame``; 0 for motions (or libraries) without labels."""
+        if not self.has_contact_labels:
+            return torch.zeros(frame.shape[0], cols.shape[0], device=frame.device)
+        return self.contact_labels[frame][:, cols].float() * self.contact_valid[self.frame_motion[frame]].float()[:, None]
 
     def future(self, frame: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
         """Global frames frame + offsets clamped to the end of each frame's motion; frame (...,), offsets (..., F)."""

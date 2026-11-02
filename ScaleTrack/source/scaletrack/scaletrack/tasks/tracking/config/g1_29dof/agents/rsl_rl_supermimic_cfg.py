@@ -77,3 +77,40 @@ class G1BFMTransformerSuperMimicHybridRunnerCfg(G1BFMTransformerSuperMimicRunner
             eval_interval_updates=1000,
             actor_checkpointing=True,
         )
+
+
+@configclass
+class G1BFMTransformerSuperMimicHOIRunnerCfg(G1BFMTransformerSuperMimicRunnerCfg):
+    """HOI tracking (one dynamic object per env, supertracker hoi_tracking_v1 inputs) with SuperMimic."""
+
+    experiment_name = "g1_bfm_supermimic_hoi_exp"
+
+    def __post_init__(self):
+        self.supermimic = dict(self.supermimic)
+        self.supermimic.update(
+            # Policy weights to start from (a robot-only checkpoint loads into the HOI policy; "" = scratch).
+            init_policy_from="",
+            ppo_critic_obs_shapes={"critic": [3, 266], "critic_task": [7, 337], "object_critic": [1, 7, 35]},
+        )
+
+
+@configclass
+class G1InspireSuperMimicHOIRunnerCfg(G1BFMTransformerSuperMimicHOIRunnerCfg):
+    """G1 + Inspire hands on all HDMI objects, warm-started from the G1 29-DoF SuperMimic M policy (remapped by name)."""
+
+    experiment_name = "g1_inspire_supermimic_hoi_exp"
+    eval_metric_keys = ["error_body_pos_g", "error_body_pos", "error_body_rot", "error_joint_pos", "error_finger_joint"]
+
+    def __post_init__(self):
+        super().__post_init__()
+        bodies, joints = 24, 53
+        self.supermimic.update(
+            actor_checkpointing=True,
+            init_policy_from="checkpoints/supermimic_m/model_43000.pt",
+            init_policy_names="checkpoints/supermimic_m/names.json",
+            ppo_critic_obs_shapes={
+                "critic": [3, 1 + (bodies - 1) * 3 + bodies * 12 + 2 * joints],
+                "critic_task": [7, bodies * 24 + 1],
+                "object_critic": [1, 7, 35],
+            },
+        )

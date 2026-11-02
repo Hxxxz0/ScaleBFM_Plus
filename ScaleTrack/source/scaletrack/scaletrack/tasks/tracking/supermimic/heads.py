@@ -67,6 +67,7 @@ class RefFrames:
     quat: torch.Tensor
     lin_vel: torch.Tensor | None = None
     ang_vel: torch.Tensor | None = None
+    joint_pos: torch.Tensor | None = None  # (..., num_joints), only for a joint tracking reward
 
 
 class TrackingHeads:
@@ -86,7 +87,7 @@ class TrackingHeads:
         self.mode_table = mode_table
         self.num_bodies = mode_table.shape[1]
         device = default_joint_pos.device
-        nj = default_joint_pos.shape[0]
+        nj = self.nj = default_joint_pos.shape[0]
         self.prop_noise = torch.cat(
             [
                 torch.full((3,), cfg.noise_gravity),
@@ -98,6 +99,8 @@ class TrackingHeads:
         mappings = [mode_table[:, :, None].expand(-1, -1, d).reshape(mode_table.shape[0], -1) for d in cfg.task_feature_dims]
         mappings.append(torch.ones(mode_table.shape[0], 1, device=device))
         self.mode_mapping_table = torch.cat(mappings, dim=-1)
+        # Optional joint-subset tracking term (name, joint indices, weight, std), mirroring the simulator's joint_pos_exp.
+        self.joint_reward: tuple[str, torch.Tensor, float, float] | None = None
         self.task_noise = torch.cat(
             [torch.full((self.num_bodies * d,), cfg.noise_task) for d in cfg.task_feature_dims] + [torch.zeros(1)]
         ).to(device)
@@ -105,7 +108,7 @@ class TrackingHeads:
     # ------------------------------------------------------------------ kinematics
 
     def bodies(self, s: torch.Tensor, com_pos_b: torch.Tensor | None = None, with_vel: bool = True) -> dict[str, torch.Tensor]:
-        p, q, qj, v, w, qd = split_state(s)
+        p, q, qj, v, w, qd = split_state(s, self.nj)
         if with_vel:
             return self.kin.forward(p, q, qj, v, w, qd, com_pos_b)
         return self.kin.forward(p, q, qj)
@@ -114,7 +117,7 @@ class TrackingHeads:
 
     def prop_obs(self, s: torch.Tensor, joint_offset: torch.Tensor) -> torch.Tensor:
         """Noise-free policy proprioception frame (..., 64): gravity, ang vel, joint pos rel, scaled joint vel."""
-        _, q, qj, _, w, qd = split_state(s)
+        _, q, qj, _, w, qd = split_state(s, self.nj)
         return torch.cat(
             [projected_gravity(q), w, qj - (self.q0 + joint_offset), qd * self.cfg.joint_vel_obs_scale], dim=-1
         )
@@ -178,7 +181,7 @@ class TrackingHeads:
     ) -> dict[str, torch.Tensor]:
         """Reward r_{t+1} of the transition (s_t, a_t) -> s_{t+1} scored against the reference of step t."""
         c = self.cfg
-        qj = split_state(s_next)[2]
+        qj = split_state(s_next, self.nj)[2]
         e_height = (ref.pos[..., 0, 2] - bodies["pos"][..., 0, 2]) ** 2
         e_pos = ((ref.pos - bodies["pos"]) ** 2).sum(-1).mean(-1)
         e_rot = quat_angle_sq(ref.quat, bodies["quat"]).mean(-1)
@@ -196,6 +199,10 @@ class TrackingHeads:
             "joint_limit": c.w_joint_limit * out_of_limits,
             "survival": c.w_alive * (1.0 - done_prob),
         }
+        if self.joint_reward is not None:
+            name, ids, weight, std = self.joint_reward
+            e_joint = ((ref.joint_pos[..., ids] - qj[..., ids]) ** 2).mean(-1)
+            terms[name] = weight * torch.exp(-e_joint / std**2)
         return {k: v * c.step_dt for k, v in terms.items()}
 
     # ------------------------------------------------------------------ helpers

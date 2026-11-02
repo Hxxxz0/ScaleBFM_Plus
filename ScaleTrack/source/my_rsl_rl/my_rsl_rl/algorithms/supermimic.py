@@ -194,6 +194,8 @@ class SuperMimic:
         }
 
         self.buffer = ReplayBuffer(num_envs, replay_capacity, task.state_dim, num_actions, ["frame", "mode", "roff"], device)
+        # Error dimensions of the robot within spec.error (the remainder, if any, belongs to an object).
+        self._robot_err_dim = task.spec.robot.err_scale.numel() if hasattr(task.spec, "robot") else None
 
         # Hundreds of small kernels per imagined step (forward kinematics, observation and reward heads): fuse them.
         def maybe_compile(fn):
@@ -202,7 +204,7 @@ class SuperMimic:
         self._wm_step = maybe_compile(self._wm_step_impl)
         self._model_step = maybe_compile(self._model_step_impl)
         self._critic_input = maybe_compile(self._critic_input_impl)
-        self._actor_step = maybe_compile(self._actor_step_impl)
+        self._actor_fwd = maybe_compile(self._actor_bf16)
         self._critic_loss = maybe_compile(self._critic_loss_impl)
         self._objective = maybe_compile(actor_objective)
         self._targets = maybe_compile(lambda_targets)
@@ -226,15 +228,17 @@ class SuperMimic:
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=prop.is_cuda):
             return self._actor(prop, task_obs, act, mode, mapping).float()
 
-    def _actor_step_impl(self, prop, task_obs, act, mode, mapping):
+    def _actor_step(self, prop, task_obs, act, mode, mapping):
+        # Checkpoint outside the compiled region: compiled recomputation functionalises the RNG of the fused attention
+        # kernels, whose state reads cannot be captured in a CUDA graph. Recomputing calls the compiled forward again.
         if self.actor_checkpointing:
-            return checkpoint(self._actor_bf16, prop, task_obs, act, mode, mapping, use_reentrant=False)
-        return self._actor_bf16(prop, task_obs, act, mode, mapping)
+            return checkpoint(self._actor_fwd, prop, task_obs, act, mode, mapping, use_reentrant=False, preserve_rng_state=False)
+        return self._actor_fwd(prop, task_obs, act, mode, mapping)
 
     @torch.no_grad()
     def act(self, obs) -> torch.Tensor:
         """Deterministic training-mode action from an environment observation dict."""
-        return self._actor(obs["policy"], obs["policy_task"], obs["action"], obs["mode"], obs["mode_mapping"])
+        return self._actor(obs["policy"], self.task.env_task_obs(obs), obs["action"], obs["mode"], obs["mode_mapping"])
 
     # ------------------------------------------------------------------ world model
 
@@ -245,7 +249,7 @@ class SuperMimic:
 
     def update_world_model(self) -> dict[str, float]:
         task = self.task
-        stats = torch.zeros(4, device=self.device)
+        stats = torch.zeros(5, device=self.device)
         for _ in range(self.wm_batches_per_update):
             w = self.buffer.sample_windows(self.wm_batch_size, self.wm_window)
             xi = task.xi_norm[w.env_ids]
@@ -257,6 +261,11 @@ class SuperMimic:
                 if j == 0:
                     stats[1] += sq.detach() / task.spec.err_scale.numel()
             stats[2] += sq.detach() / task.spec.err_scale.numel()
+            if self._robot_err_dim is not None:
+                with torch.no_grad():
+                    e = task.spec.error(s, w.states[-1])[..., self._robot_err_dim :]
+                    valid = w.states[-1][:, task.spec.valid_index]
+                    stats[4] += ((e * e).mean(-1) * valid).sum() / valid.sum().clamp_min(1.0)
             loss = loss / self.wm_window
             self.wm_optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -265,21 +274,23 @@ class SuperMimic:
             self.wm_optimizer.step()
             stats[0] += loss.detach()
         stats = (stats / self.wm_batches_per_update).tolist()
-        return {"wm_loss": stats[0], "wm_nse_1step": stats[1], "wm_nse_kstep": stats[2], "wm_grad_norm": stats[3]}
+        out = {"wm_loss": stats[0], "wm_nse_1step": stats[1], "wm_nse_kstep": stats[2], "wm_grad_norm": stats[3]}
+        if self._robot_err_dim is not None:
+            out["wm_object_nse_kstep"] = stats[4]
+        return out
 
     # ------------------------------------------------------------------ imagination
 
-    def _model_step_impl(self, s, a, prev_a, frame, roff, mode_ids, xi_norm, joint_offset, com_pos_b):
+    def _model_step_impl(self, s, a, prev_a, frame, roff, mode_ids, ctx):
         """One imagined step after the actor: dynamics, reward / termination and the next observations.
 
         The critic input of the next state is computed without gradient: only the value beyond the horizon is
         differentiated (``_critic_input`` of the final state), bootstraps at truncation are constants.
         """
         task = self.task
-        ctx = {"xi_norm": xi_norm, "joint_offset": joint_offset, "com_pos_b": com_pos_b}
-        s_next = self.world_model(s, a, xi_norm)
+        s_next = self.world_model(s, a, ctx["xi_norm"])
         bodies = task.bodies(s_next, ctx)
-        tr = task.transition(s_next, bodies, a, prev_a, frame)
+        tr = task.transition(s_next, bodies, a, prev_a, frame, s_prev=s)
         frame_next = task.next_frame(frame)
         with torch.no_grad():
             critic_in = task.critic_features(s_next, bodies, frame_next, mode_ids, ctx)
@@ -289,20 +300,18 @@ class SuperMimic:
             "truncated": tr["truncated"],
             "terms": torch.stack([tr["terms"][k] for k in task.reward_term_names]),
             "prop": task.prop_obs(s_next, ctx, noise=True),
-            "task_obs": task.policy_task_obs(bodies, frame_next, roff, noise=True),
+            "task_obs": task.policy_task_obs(bodies, frame_next, roff, noise=True, s=s_next),
             "critic_in": critic_in,
         }
         return s_next, frame_next, out
 
-    def _critic_input_impl(self, s, frame, mode_ids, xi_norm, joint_offset, com_pos_b):
-        ctx = {"xi_norm": xi_norm, "joint_offset": joint_offset, "com_pos_b": com_pos_b}
+    def _critic_input_impl(self, s, frame, mode_ids, ctx):
         return self.task.critic_features(s, self.task.bodies(s, ctx), frame, mode_ids, ctx)
 
     def imagine(self, start: StartBatch) -> dict:
         """Roll the policy through the world model; returns per-step tensors with gradients to the actor."""
         task, H = self.task, self.horizon
         ctx = task.context(start.env_ids)
-        args = (ctx["xi_norm"], ctx["joint_offset"], ctx["com_pos_b"])
         frame, mode_ids, roff = start.info["frame"], start.info["mode"], start.info["roff"]
         mode, mapping = task.mode_inputs(mode_ids)
         prop_hist = torch.stack([task.prop_obs(start.hist_states[i], ctx, noise=True) for i in range(self.history_length)], 1)
@@ -310,13 +319,13 @@ class SuperMimic:
 
         s = start.state
         bodies = task.bodies(s, ctx)
-        task_obs = task.policy_task_obs(bodies, frame, roff, noise=True)
+        task_obs = task.policy_task_obs(bodies, frame, roff, noise=True, s=s)
         with torch.no_grad():
             critic_in = [task.critic_features(s, bodies, frame, mode_ids, ctx)]
         rewards, dones, truncs, actions, terms = [], [], [], [], []
         for _ in range(H):
             a = self._actor_step(prop_hist, task_obs, act_hist, mode, mapping)
-            s, frame, out = self._model_step(s, a, act_hist[:, -1], frame, roff, mode_ids, *args)
+            s, frame, out = self._model_step(s, a, act_hist[:, -1], frame, roff, mode_ids, ctx)
             rewards.append(out["reward"])
             dones.append(out["done"])
             truncs.append(out["truncated"])
@@ -332,7 +341,7 @@ class SuperMimic:
             "truncated": torch.stack(truncs).float(),  # (H, n) transition t truncates the episode
             "actions": torch.stack(actions),
             "critic_in": torch.stack(critic_in),  # (H + 1, n, C), no gradient
-            "critic_in_final": self._critic_input(s, frame, mode_ids, *args),  # (n, C), differentiable
+            "critic_in_final": self._critic_input(s, frame, mode_ids, ctx),  # (n, C), differentiable
             "terms": torch.stack(terms).mean(dim=2),  # (H, num_terms)
         }
 

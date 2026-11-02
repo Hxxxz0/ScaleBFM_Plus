@@ -84,7 +84,9 @@ def quat_angle_sq(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
 def quat_from_axis_angle(axis: torch.Tensor, angle: torch.Tensor) -> torch.Tensor:
     """axis (..., 3) unit vectors, angle (...,) -> wxyz quaternion."""
     half = 0.5 * angle
-    return torch.cat([torch.cos(half)[..., None], axis * torch.sin(half)[..., None]], dim=-1)
+    s = torch.sin(half)
+    ax, ay, az = axis.unbind(-1)
+    return torch.stack([torch.cos(half), ax * s, ay * s, az * s], dim=-1)
 
 
 def heading_yaw(q: torch.Tensor) -> torch.Tensor:

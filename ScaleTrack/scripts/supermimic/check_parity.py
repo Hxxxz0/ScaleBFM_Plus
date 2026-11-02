@@ -38,6 +38,7 @@ cfg = parse_env_cfg(args.task, device=args.device, num_envs=args.num_envs)
 cfg.commands.motion.motion_lib_dir = args.motion_lib
 cfg.observations.policy.enable_corruption = False
 cfg.observations.policy_task.enable_corruption = False
+cfg.events.push_robot = None
 cfg.action_noise_std = 0.0
 cfg.actions.joint_pos.noise_std = 0.0
 env = gym.make(args.task, cfg=cfg).unwrapped
@@ -48,7 +49,14 @@ all_envs = torch.arange(N, device=env.device)
 ctx = task.context(all_envs)
 robot = task.robot
 cmd = task.command
-buf = ReplayBuffer(N, 400, task.state_dim, 29, ["frame", "mode", "roff"], env.device)
+A = env.action_manager.total_action_dim
+J = len(robot.joint_names)
+buf = ReplayBuffer(N, 400, task.state_dim, A, ["frame", "mode", "roff"], env.device)
+hoi = hasattr(task, "obj_ref")
+if hoi:
+    from scaletrack.tasks.tracking.supermimic.object_heads import object_reward_terms
+
+    O = task.obj_slice
 
 worst: dict[str, float] = {}
 
@@ -60,7 +68,7 @@ def record(name: str, value: torch.Tensor | float):
 
 state, info = task.read_state(), task.step_info()
 ep_start = torch.ones(N, dtype=torch.bool, device=env.device)
-prev_action = torch.zeros(N, 29, device=env.device)
+prev_action = torch.zeros(N, A, device=env.device)
 n_term = 0
 n_trunc = 0
 for step in range(args.steps):
@@ -76,16 +84,40 @@ for step in range(args.steps):
             record(f"fk_ang_vel{tag}", (bodies["ang_vel"] - data.body_ang_vel_w[:, ids])[sel].norm(dim=-1).max())
             record(f"fk_com_lin_vel{tag}", (bodies["com_lin_vel"] - data.body_lin_vel_w[:, ids])[sel].norm(dim=-1).max())
             err = (prop - obs["policy"][:, -1])[sel].abs().amax(0)
-            for name, sl in (("gravity", slice(0, 3)), ("ang_vel", slice(3, 6)), ("joint_pos", slice(6, 35)), ("joint_vel", slice(35, 64))):
+            for name, sl in (("gravity", slice(0, 3)), ("ang_vel", slice(3, 6)), ("joint_pos", slice(6, 6 + J)), ("joint_vel", slice(6 + J, 6 + 2 * J))):
                 record(f"obs_prop_{name}{tag}", err[sl].max())
-    task_obs = task.policy_task_obs(bodies, info["frame"], info["roff"], noise=False)
+    task_obs = task.policy_task_obs(bodies, info["frame"], info["roff"], noise=False, s=state)
+    if hoi:
+        task_obs, obj_obs, *bps = task_obs
+        if task.use_contact_labels:
+            contact = bps.pop()
+            record("obs_contact_ref", (contact - obs["contact_ref"]).abs().max())
+            record("contact_ref_valid_envs", obs["contact_ref"][..., -1].sum())
+            record("contact_ref_nonzero_labels", (obs["contact_ref"][..., :-1] != 0).sum())
+        if bps:
+            bps_err = (bps[0] - obs["hand_bps"]).abs()
+            record("obs_hand_bps", bps_err.max())
+            # Nearest surface points are discontinuous: a tie broken differently moves one vector by a sample spacing.
+            record("obs_hand_bps_mean", bps_err.mean())
+            record("obs_hand_bps_frac_over_1mm", (bps_err > 1e-3).float().mean())
+            record("hand_bps_nonzero_envs", (obs["hand_bps"][..., :-1].abs().sum(-1) > 0).sum())
+        record("obs_object_token", (obj_obs - obs["object_actor"]).abs().max())
+        valid = state[:, task.spec.valid_index] > 0.5
+        record("object_valid_mismatch", (valid != cmd.object_valid).sum())
+        if ep_start.any():
+            # After a reset the object of an object motion sits at its reference.
+            sel = ep_start & valid
+            if sel.any():
+                # The reset frame: one before the scored frame, except after the explicit env.reset().
+                ref_now = task.obj_ref[info["frame"] - int(step > 0)][sel]
+                record("object_reset_pos_m", (state[sel][:, O][:, :3] - ref_now[:, :3]).norm(dim=-1).max())
     record("obs_task", (task_obs - obs["policy_task"]).abs().max())
     mode, mapping = task.mode_inputs(info["mode"])
     record("obs_mode", (mode - obs["mode"]).abs().max())
     record("obs_mode_mapping", (mapping - obs["mode_mapping"]).abs().max())
 
     # ---- histories rebuilt from the replay buffer (needs the current row in the buffer)
-    actions = args.action_std * torch.randn(N, 29, device=env.device)
+    actions = args.action_std * torch.randn(N, A, device=env.device)
     buf.add(state, actions, actions, info, ep_start)
     # the newest row of every env is the current step
     buf._start_candidates = all_envs * buf.T + (buf.ptr - 1) % buf.T
@@ -107,13 +139,38 @@ for step in range(args.steps):
     b_next = task.bodies(s_next, ctx)
     ref = task.reference(info["frame"])
     hard = task.heads.termination(b_next, ref)
+    if hoi:
+        obj_err = (s_next[:, O][:, :3] - task.obj_ref[info["frame"]][:, :3]).norm(dim=-1)
+        hard |= (s_next[:, task.spec.valid_index] > 0.5) & (obj_err > task.obj_cfg.term_threshold)
+        hard |= env.termination_manager.get_term("physical_invalid")
     record("termination_mismatch", (hard != terminated).float().sum())
-    imagined_trunc = task.transition(s_next, b_next, actions, prev_action, info["frame"])["truncated"]
+    imagined_trunc = task.transition(s_next, b_next, actions, prev_action, info["frame"], s_prev=state)["truncated"]
     sim_trunc = env.termination_manager.get_term("motion_time_out")
     record("truncation_mismatch", (imagined_trunc != sim_trunc).float().sum())
     n_trunc += int(sim_trunc.sum())
     n_term += int(terminated.sum())
     terms = task.heads.reward_terms(s_next, b_next, actions, prev_action, ref, terminated.float())
+    if hoi:
+        f = info["frame"]
+        obj_terms = object_reward_terms(
+            task.obj_cfg, state[:, O], s_next[:, O], task.obj_ref[task.previous_frame(f)], task.obj_ref[f],
+            b_next["pos"], task.lib.body_pos_w[f], s_next[:, task.spec.valid_index],
+        )  # fmt: skip
+        terms["object_motion"] = task.obj_cfg.w_motion * obj_terms["object_motion"] * env.step_dt
+        terms["object_relation"] = task.obj_cfg.w_relation * obj_terms["object_relation"] * env.step_dt
+        if task.use_contact_reward:
+            terms["object_contact"] = task.contact_reward(s_next, b_next, f)
+            # Imagined batches are replay samples, not environments: the term must not depend on the env order.
+            perm = torch.randperm(s_next.shape[0], device=s_next.device)
+            b_perm = {k: v[perm] for k, v in b_next.items() if torch.is_tensor(v)}
+            record("contact_reward_permutation", (task.contact_reward(s_next[perm], b_perm, f[perm]) - terms["object_contact"][perm]).abs().max())
+            half = s_next.shape[0] // 2
+            b_half = {k: v[:half] for k, v in b_next.items() if torch.is_tensor(v)}
+            record("contact_reward_subbatch", (task.contact_reward(s_next[:half], b_half, f[:half]) - terms["object_contact"][:half]).abs().max())
+            record("contact_reward_labelled_envs", (task.lib.contact_labels_at(f, task.contact_label_cols) != 0).any(-1).sum())
+            record("contact_reward_mean", terms["object_contact"].mean() / env.step_dt)
+        n_moving = int((obj_terms["object_motion"] > 0).sum())
+        record("object_reward_active_envs", n_moving)
     reward = sum(terms.values())
     record("reward_abs", (reward - rew).abs().max())
     record("reward_rel", ((reward - rew).abs() / rew.abs().clamp_min(1e-3)).max())

@@ -126,12 +126,63 @@ class ActorCriticHumanoidTransformer(nn.Module):
             self.critic.init_weights()
             self.critic_task_embedder.init_weights()
 
+        # Object tokens (N, K, F, 35) of supertracker's hoi_tracking_v1 (ObjectTaskEmbedder): a masked mean over the
+        # K objects of an MLP of their features is added to the task token of every reference frame. The output layer
+        # starts near zero, so a robot-only checkpoint keeps its behaviour.
+        self.use_objects = "object_actor" in obs
+        # Extra actor inputs encoded like the object tokens (validity last), in this order after the task obs.
+        self.actor_extra_groups = [g for g in ("object_actor", "hand_bps", "contact_ref") if g in obs]
+        if self.use_objects:
+            self.actor_object_encoder = self._object_encoder(obs["object_actor"].shape[-1] - 1, embedding_dim)
+        if "hand_bps" in obs:
+            self.actor_hand_bps_encoder = self._object_encoder(obs["hand_bps"].shape[-1] - 1, embedding_dim)
+            if use_transformer_critic and "object_critic" in obs:
+                self.critic_object_encoder = self._object_encoder(obs["object_critic"].shape[-1] - 1, embedding_dim)
+        if "contact_ref" in obs:
+            # Reference contact labels of the next frames (HDMI's reference_contact_labels).
+            self.actor_contact_encoder = self._object_encoder(obs["contact_ref"].shape[-1] - 1, embedding_dim)
+
         # Action distribution
         # Note: Populated in update_distribution
         self.distribution = None
 
         # Disable args validation for speedup
         Normal.set_default_validate_args(False)
+
+    @staticmethod
+    def _object_encoder(in_dim: int, width: int) -> nn.Module:
+        encoder = nn.Sequential(nn.Linear(in_dim, width), nn.SiLU(), nn.Linear(width, width))
+        nn.init.normal_(encoder[-1].weight, std=0.001)
+        nn.init.zeros_(encoder[-1].bias)
+        return encoder
+
+    @staticmethod
+    def _object_context(encoder: nn.Module, objects: torch.Tensor) -> torch.Tensor:
+        """(N, K, F, D) object tokens with a validity flag last -> (N, F, W); invalid (even NaN) tokens add nothing."""
+        valid = objects[..., -1:] > 0.5
+        features = torch.where(valid, objects[..., :-1], torch.zeros_like(objects[..., :-1]))
+        encoded = encoder(features)
+        encoded = torch.where(valid, encoded, torch.zeros_like(encoded))
+        return encoded.sum(1) / valid.sum(1).clamp_min(1)
+
+    def _actor_encoders(self):
+        encoders = {"object_actor": "actor_object_encoder", "hand_bps": "actor_hand_bps_encoder", "contact_ref": "actor_contact_encoder"}
+        return [getattr(self, encoders[g]) for g in self.actor_extra_groups]
+
+    def _actor_tokens(self, task_obs) -> torch.Tensor:
+        if isinstance(task_obs, (tuple, list)):
+            robot, *extras = task_obs
+            tokens = self.actor_task_embedder(robot)
+            for encoder, x in zip(self._actor_encoders(), extras):
+                tokens = tokens + self._object_context(encoder, x)
+            return tokens
+        return self.actor_task_embedder(task_obs)
+
+    def _critic_tokens(self, task_obs) -> torch.Tensor:
+        if isinstance(task_obs, (tuple, list)):
+            robot, objects = task_obs
+            return self.critic_task_embedder(robot) + self._object_context(self.critic_object_encoder, objects)
+        return self.critic_task_embedder(task_obs)
 
     def reset(self, dones: torch.Tensor | None = None) -> None:
         pass
@@ -152,7 +203,7 @@ class ActorCriticHumanoidTransformer(nn.Module):
         return self.distribution.entropy().sum(dim=-1)
 
     def _update_distribution(self, prop_obs: TensorDict, task_obs: TensorDict, action_obs: TensorDict) -> None:
-        task_tokens = self.actor_task_embedder(task_obs)
+        task_tokens = self._actor_tokens(task_obs)
         if self.state_dependent_std:
             # Compute mean and standard deviation
             mean_and_std = self.actor(prop_obs, action_obs, task_tokens)
@@ -185,7 +236,7 @@ class ActorCriticHumanoidTransformer(nn.Module):
 
     def act_inference(self, obs: TensorDict) -> torch.Tensor:
         actor_prop_obs, actor_task_obs, actor_action_obs = self.get_actor_obs(obs, inference=True)
-        actor_task_tokens = self.actor_task_embedder(actor_task_obs)
+        actor_task_tokens = self._actor_tokens(actor_task_obs)
         if self.state_dependent_std:
             mean_and_std = self.actor(actor_prop_obs, actor_action_obs, actor_task_tokens)
             mean, _ = torch.chunk(mean_and_std, 2, dim=-1)
@@ -207,9 +258,12 @@ class ActorCriticHumanoidTransformer(nn.Module):
         operations so it can be back-propagated through (prop_obs (N, C, P), task_obs (N, F, T), action_obs
         (N, C, A), mode (N, M), mode_mapping (N, T)).
         """
+        extras = None
+        if isinstance(task_obs, (tuple, list)):
+            task_obs, *extras = task_obs
         task_obs = task_obs * mode_mapping.unsqueeze(-2)
         task_obs = torch.cat([task_obs, mode.unsqueeze(-2).expand(-1, task_obs.shape[-2], -1)], dim=-1)
-        out = self.actor(prop_obs, action_obs, self.actor_task_embedder(task_obs))
+        out = self.actor(prop_obs, action_obs, self._actor_tokens(task_obs if extras is None else (task_obs, *extras)))
         if self.state_dependent_std:
             out = torch.chunk(out, 2, dim=-1)[0]
         return out
@@ -217,7 +271,7 @@ class ActorCriticHumanoidTransformer(nn.Module):
     def evaluate(self, obs: TensorDict, **kwargs: dict[str, Any]) -> torch.Tensor:
         prop_obs, task_obs, action_obs = self.get_critic_obs(obs)
         if self.use_transformer_critic:
-            task_tokens = self.critic_task_embedder(task_obs)
+            task_tokens = self._critic_tokens(task_obs)
             value = self.critic(prop_obs, action_obs, task_tokens)
         else:
             context = torch.cat([
@@ -249,12 +303,15 @@ class ActorCriticHumanoidTransformer(nn.Module):
                 mode_obs = mode_obs.unsqueeze(-2).repeat(1, task_obs.shape[-2], 1)
             
             if not inference:
-                task_obs *= mode_mapping
+                # Not in place: task_obs is the observation tensor of the rollout storage.
+                task_obs = task_obs * mode_mapping
             else:
                 mode_obs = torch.ones_like(mode_obs, device=mode_obs.device)
 
             task_obs = torch.cat([task_obs, mode_obs], dim=-1)
 
+        if self.actor_extra_groups:
+            return prop_obs, (task_obs, *[obs[g] for g in self.actor_extra_groups]), action_obs
         return prop_obs, task_obs, action_obs
 
     def get_critic_obs(self, obs: TensorDict):
@@ -267,6 +324,8 @@ class ActorCriticHumanoidTransformer(nn.Module):
         action_obs = obs["action"]
         if action_obs.dim() == 2:
             action_obs = action_obs.unsqueeze(-2)
+        if self.use_objects and hasattr(self, "critic_object_encoder"):
+            return prop_obs, (task_obs, obs["object_critic"]), action_obs
         return prop_obs, task_obs, action_obs
 
     def get_actions_log_prob(self, actions: torch.Tensor) -> torch.Tensor:
@@ -298,6 +357,8 @@ class ActorCriticHumanoidTransformer(nn.Module):
     def actor_parameters(self):
         params = list(self.actor.parameters())
         params += list(self.actor_task_embedder.parameters())
+        for encoder in self._actor_encoders():
+            params += list(encoder.parameters())
 
         if not self.state_dependent_std:
             if self.noise_std_type == "scalar":
@@ -313,5 +374,7 @@ class ActorCriticHumanoidTransformer(nn.Module):
         
         if self.use_transformer_critic:
             params += list(self.critic_task_embedder.parameters())
+            if hasattr(self, "critic_object_encoder"):
+                params += list(self.critic_object_encoder.parameters())
 
         return params

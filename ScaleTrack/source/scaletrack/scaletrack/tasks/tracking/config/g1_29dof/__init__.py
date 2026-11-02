@@ -54,3 +54,75 @@ gym.register(
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_supermimic_cfg:G1BFMTransformerSuperMimicHybridRunnerCfg",
     },
 )
+
+gym.register(
+    id="G1-BFM-Transformer-Tracking-SuperMimic-HOI",
+    entry_point="scaletrack.tasks.tracking.supermimic.hoi_env:HOITrackingEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": "scaletrack.tasks.tracking.supermimic.hoi_env:G1BFMTrackingSuperMimicHOIEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_supermimic_cfg:G1BFMTransformerSuperMimicHOIRunnerCfg",
+    },
+)
+
+gym.register(
+    id="G1-BFM-Transformer-Tracking-PPO-Benchmark-HOI",
+    entry_point="scaletrack.tasks.tracking.supermimic.hoi_env:HOITrackingEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": "scaletrack.tasks.tracking.supermimic.hoi_env:G1BFMTrackingPPOBenchmarkHOIEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_benchmark_cfg:G1BFMTransformerPPOBenchmarkHOIRunnerCfg",
+    },
+)
+
+gym.register(
+    id="G1Inspire-BFM-Transformer-Tracking-SuperMimic-HOI",
+    entry_point="scaletrack.tasks.tracking.supermimic.hoi_env:HOITrackingEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": "scaletrack.tasks.tracking.supermimic.hoi_env:G1InspireSuperMimicHOIEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_supermimic_cfg:G1InspireSuperMimicHOIRunnerCfg",
+    },
+)
+
+
+gym.register(
+    id="G1Inspire-BFM-Transformer-Tracking-SuperMimic-HOI-Contact",
+    entry_point="scaletrack.tasks.tracking.supermimic.hoi_env:HOITrackingEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": "scaletrack.tasks.tracking.supermimic.hoi_env:G1InspireSuperMimicHOIContactEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_supermimic_cfg:G1InspireSuperMimicHOIRunnerCfg",
+    },
+)
+
+
+gym.register(
+    id="G1Inspire-BFM-Transformer-Tracking-SuperMimic-HOI-ContactReward",
+    entry_point="scaletrack.tasks.tracking.supermimic.hoi_env:HOITrackingEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": "scaletrack.tasks.tracking.supermimic.hoi_env:G1InspireSuperMimicHOIContactRewardEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_supermimic_cfg:G1InspireSuperMimicHOIRunnerCfg",
+    },
+)
+
+gym.register(
+    id="G1Inspire-BFM-Transformer-Tracking-SuperMimic-HOI-ContactRetry",
+    entry_point="scaletrack.tasks.tracking.supermimic.hoi_env:HOITrackingEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": "scaletrack.tasks.tracking.supermimic.hoi_env:G1InspireSuperMimicHOIContactRetryEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_supermimic_cfg:G1InspireSuperMimicHOIRunnerCfg",
+    },
+)
+
+gym.register(
+    id="G1Inspire-BFM-Transformer-Tracking-PPO-HOI-ContactRetry",
+    entry_point="scaletrack.tasks.tracking.supermimic.hoi_env:HOITrackingEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": "scaletrack.tasks.tracking.supermimic.hoi_env:G1InspirePPOHOIContactRetryEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_benchmark_cfg:G1InspirePPOHOIRunnerCfg",
+    },
+)

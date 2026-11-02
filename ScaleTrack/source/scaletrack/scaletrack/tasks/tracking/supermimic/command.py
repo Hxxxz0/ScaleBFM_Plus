@@ -84,6 +84,12 @@ class SuperMimicMotionCommand(MotionCommand):
             "error_joint_pos", "error_joint_vel", "error_body_lin_vel", "error_body_ang_vel",
         ):  # fmt: skip
             self.metrics[k] = torch.zeros(self.num_envs, device=self.device)
+        # Finger joint error (rad) of robots whose fingers have a tracking reward (G1 + Inspire).
+        finger_term = getattr(env.cfg.rewards, "motion_finger_joint", None)
+        self._finger_joint_ids = None
+        if finger_term is not None:
+            self._finger_joint_ids = self.robot.find_joints(finger_term.params["asset_cfg"].joint_names)[0]
+            self.metrics["error_finger_joint"] = torch.zeros(self.num_envs, device=self.device)
         self.is_evaluating = False
         self.randomize_next_resampling = True
 
@@ -196,6 +202,9 @@ class SuperMimicMotionCommand(MotionCommand):
     def _update_metrics(self):
         if self.is_evaluating:
             super()._update_metrics()
+            if self._finger_joint_ids is not None:
+                ids = self._finger_joint_ids
+                self.metrics["error_finger_joint"] = (self.joint_pos[:, ids] - self.robot_joint_pos[:, ids]).abs().mean(-1)
 
     # ------------------------------------------------------------------ return-based reset sampling
 
@@ -205,7 +214,7 @@ class SuperMimicMotionCommand(MotionCommand):
             return
         pos = self.ep_len[env_ids].clamp_max(self.max_episode_steps - 1)
         frame = self.global_frame[env_ids]
-        self.ep_rewards[env_ids, pos] = self._env.reward_buf[env_ids]
+        self.ep_rewards[env_ids, pos] = self._bin_reward(env_ids)
         self.ep_bins[env_ids, pos] = self.train_lib.frame_bin[frame]
         # Transitions left until the episode ends without failure: the motion is truncated on its last frame,
         # the episode at the time limit (episode_length_buf already counts this step).
@@ -213,6 +222,14 @@ class SuperMimicMotionCommand(MotionCommand):
         to_time_limit = int(self._env.max_episode_length) - self._env.episode_length_buf[env_ids] + 1
         self.ep_horizon[env_ids, pos] = torch.minimum(to_motion_end, to_time_limit).clamp_min(1)
         self.ep_len[env_ids] = (self.ep_len[env_ids] + 1).clamp_max(self.max_episode_steps)
+
+    def _bin_reward(self, env_ids: torch.Tensor) -> torch.Tensor:
+        """Step reward that the return-based reset sampling scores (normalised by cfg.max_step_reward)."""
+        return self._env.reward_buf[env_ids]
+
+    def _evaluation_start(self, env_ids: torch.Tensor) -> torch.Tensor | int:
+        """Local frame every evaluation episode starts from."""
+        return 0
 
     def _finalize_episodes(self, env_ids: torch.Tensor):
         """Fold the normalised discounted returns-to-go of finished episodes into the per-bin estimates.
@@ -238,6 +255,10 @@ class SuperMimicMotionCommand(MotionCommand):
         mean = sums[touched] / counts[touched]
         self.bin_return[touched] = (1 - cfg.bin_ema) * self.bin_return[touched] + cfg.bin_ema * mean
         self.ep_len[env_ids] = 0
+
+    def _start_frames(self, env_ids: torch.Tensor) -> torch.Tensor:
+        """Training start frames of the environments env_ids."""
+        return self._sample_start_frames(len(env_ids))
 
     def _sample_start_frames(self, n: int) -> torch.Tensor:
         cfg, lib = self.cfg, self.train_lib
@@ -270,7 +291,7 @@ class SuperMimicMotionCommand(MotionCommand):
             return
         env_ids = torch.as_tensor(env_ids, device=self.device)
         if self.is_evaluating:
-            self.time_steps[env_ids] = 0
+            self.time_steps[env_ids] = self._evaluation_start(env_ids)
         else:
             if getattr(self._env, "_explicit_reset", False):
                 # env.reset() (start, after an evaluation): no episode ended, drop the partial logs.
@@ -279,7 +300,7 @@ class SuperMimicMotionCommand(MotionCommand):
                 # The reward of the final transition was computed before this reset.
                 self._log_step_rewards(env_ids)
                 self._finalize_episodes(env_ids)
-            frames = self._sample_start_frames(len(env_ids))
+            frames = self._start_frames(env_ids)
             if self.reset_sampler is not None:
                 frames = self.reset_sampler.select(
                     frames, env_ids, getattr(self._env, "_motion_reset_context", None), self._failure_reset_active

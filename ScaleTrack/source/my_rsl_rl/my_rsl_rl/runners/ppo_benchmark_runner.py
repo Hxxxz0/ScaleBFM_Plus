@@ -31,6 +31,7 @@ class PPOBenchmarkRunner(OnPolicyRunner):
     evaluate_test_set = SuperMimicRunner.evaluate_test_set
     _allreduce_sum = SuperMimicRunner._allreduce_sum
     _broadcast_scalar = SuperMimicRunner._broadcast_scalar
+    _broadcast_values = SuperMimicRunner._broadcast_values
 
     @torch.inference_mode()
     def _checkpoint_and_eval(self, final=False):

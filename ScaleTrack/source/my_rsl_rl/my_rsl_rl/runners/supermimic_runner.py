@@ -21,7 +21,7 @@ from my_rsl_rl.modules import ActorCriticHumanoidTransformer
 from my_rsl_rl.runners.on_policy_runner import OnPolicyRunner
 from my_rsl_rl.runners.training_budget import TrainingBudget, cosine_lr_ratio
 from my_rsl_rl.utils import resolve_obs_groups, store_code_state
-from my_rsl_rl.utils.compile_cache import CompileCache, source_digest
+from my_rsl_rl.utils.compile_cache import CompileCache
 
 
 class SuperMimicRunner(OnPolicyRunner):
@@ -62,20 +62,26 @@ class SuperMimicRunner(OnPolicyRunner):
         self.eval_interval_updates = self.sm_cfg.pop("eval_interval_updates", 0)
         self.eval_interval_minutes = self.sm_cfg.pop("eval_interval_minutes")
         self.log_interval = self.sm_cfg.pop("log_interval")
+        init_policy_from = self.sm_cfg.pop("init_policy_from", "")
+        self.init_policy_names = self.sm_cfg.pop("init_policy_names", "")
         if self.log_interval < 1 or self.eval_interval_updates < 0:
             raise ValueError("log_interval must be positive and eval_interval_updates nonnegative")
         if self.eval_interval_updates and self.eval_interval_updates % self.log_interval:
             raise ValueError("eval_interval_updates must be a multiple of log_interval")
         self.alg = SuperMimic(self.policy, self.task, self.env.num_envs, device, self.env.num_actions, **self.sm_cfg)
         alg = self.alg
+        if init_policy_from:
+            self._init_policy(init_policy_from)
         self.compile_cache = CompileCache(
             os.environ.get("SCALETRACK_COMPILE_CACHE_DIR"),
             dict(
-                source=source_digest(Path(__file__).resolve().parents[1], Path(inspect.getfile(type(self.task))).parent),
                 policy=policy_cfg,
                 shapes=(alg.imagination_batch_size, alg.actor_micro_batch_size, alg.horizon, alg.wm_batch_size,
-                        alg.wm_window, alg.history_length, alg.actor_checkpointing),
+                        alg.wm_window, alg.history_length, alg.actor_checkpointing, self.task.state_dim,
+                        self.task.xi_dim, self.task.critic_dim, self.env.num_actions),
             ),
+            sources=(Path(__file__).resolve().parents[1], Path(inspect.getfile(type(self.task))).parent),
+            root=Path(__file__).resolve().parents[4],
         )  # fmt: skip
 
         self.disable_logs = self.is_distributed and self.gpu_global_rank != 0
@@ -88,12 +94,83 @@ class SuperMimicRunner(OnPolicyRunner):
         if not self.disable_logs:
             actor_params = sum(p.numel() for p in self.policy.actor.parameters())
             actor_params += sum(p.numel() for p in self.policy.actor_task_embedder.parameters())
+            if hasattr(self.policy, "_actor_encoders"):
+                actor_params += sum(p.numel() for e in self.policy._actor_encoders() for p in e.parameters())
             print(
                 f"[model] deployment_actor_parameters={actor_params} world_size={self.gpu_world_size} "
                 f"imagination_global_batch={self.alg.imagination_batch_size * self.gpu_world_size} "
                 f"learning_rates={self.alg.base_lrs}",
                 flush=True,
             )
+
+    def _init_policy(self, path: str) -> None:
+        """Initialise the policy from a checkpoint.
+
+        Parameters missing from the checkpoint keep their initialisation (e.g. the object encoders, near zero).
+        When the robot differs (``init_policy_names``: index.json of a library of the checkpoint's robot, holding its
+        joint and body names), the actor's joint / action / body dimensions are remapped by name: new inputs get zero
+        weights and new outputs zero rows, so the checkpoint's joints behave as before and new joints hold their
+        default. The (untrained) transformer critic is left initialised. World model and critic are not loaded. Every
+        rank loads the same file, so the replicas stay identical."""
+        state = torch.load(path, map_location=self.device, weights_only=False)["model_state_dict"]
+        own = self.policy.state_dict()
+        unexpected = [k for k in state if k not in own]
+        mismatched = [k for k in state if k in own and own[k].shape != state[k].shape]
+        if unexpected:
+            raise ValueError(f"init_policy_from {path}: unexpected {unexpected}")
+        if mismatched:
+            if not self.init_policy_names:
+                raise ValueError(f"init_policy_from {path}: shape mismatch {mismatched}; set init_policy_names to remap")
+            state = self._remap_actor(state, own, mismatched)
+        self.policy.load_state_dict(state, strict=False)
+        if int(os.getenv("RANK", "0")) == 0:
+            print(f"[init] policy from {path}; remapped {mismatched}; new parameters: {sorted(set(own) - set(state))}", flush=True)
+
+    def _remap_actor(self, state: dict, own: dict, keys: list[str]) -> dict:
+        import json
+
+        old = json.loads(Path(self.init_policy_names).read_text())
+        env = self.env.unwrapped
+        command = env.command_manager.get_term(self.command_name)
+        new_joints = list(command.robot.joint_names)
+        new_actions = list(env.action_manager.get_term("joint_pos")._joint_names)
+        new_bodies = list(command.cfg.body_names)
+        old_joints, old_bodies = old["joint_names"], old["body_names"]
+
+        def index(names, new):
+            return [new.index(n) for n in names]
+
+        jo, ja, bo = index(old_joints, new_joints), index(old_joints, new_actions), index(old_bodies, new_bodies)
+        Jo, Jn, Bo, Bn = len(old_joints), len(new_joints), len(old_bodies), len(new_bodies)
+        # Columns of the prop frame [gravity 3, ang vel 3, joint pos J, joint vel J].
+        prop_cols = list(range(6)) + [6 + j for j in jo] + [6 + Jn + j for j in jo]
+        # Columns of a task frame [pos 3B, pos_rel 3B, rot 6B, rot_rel 6B, time 1] followed by the mode (B).
+        task_cols, off_n = [], 0
+        for d in (3, 3, 6, 6):
+            task_cols += [off_n + b * d + i for b in bo for i in range(d)]
+            off_n += Bn * d
+        task_cols += [off_n] + [off_n + 1 + b for b in bo]
+        out = dict(state)
+        for k in keys:
+            old_t, new_t = state[k], torch.zeros_like(own[k])
+            if k.startswith(("critic.", "critic_task_embedder.")):
+                del out[k]  # untrained in SuperMimic: keep the fresh initialisation
+                continue
+            if k == "actor.prop_projection.weight":
+                new_t[:, prop_cols] = old_t
+            elif k == "actor.action_projection.weight":
+                new_t[:, ja] = old_t
+            elif k in ("actor.projection_head.weight", "actor.projection_head.bias"):
+                new_t[ja] = old_t
+            elif k in ("std", "log_std"):
+                new_t = own[k].clone()
+                new_t[ja] = old_t
+            elif k.startswith("actor_task_embedder.") and k.endswith("weight") and old_t.dim() == 2:
+                new_t[:, task_cols] = old_t
+            else:
+                raise ValueError(f"cannot remap {k}: {tuple(old_t.shape)} -> {tuple(new_t.shape)}")
+            out[k] = new_t
+        return out
 
     # ------------------------------------------------------------------ distributed helpers
 
@@ -130,7 +207,11 @@ class SuperMimicRunner(OnPolicyRunner):
         budget_s = self.budget.seconds
         t_start = time.time()
         last_eval = t_start
-        policy_start = None  # wall-clock time of the first policy update (hour budgets schedule the LR over time)
+        # Wall-clock time of the first policy update (hour budgets schedule the LR over time); a resumed run past the
+        # world-model-only updates schedules over its own budget.
+        policy_start = 0.0 if self.num_updates > self.wm_only_updates else None
+        run_steps = 0  # environment steps of this run: a resumed run refills its (empty) replay buffer first
+        cache_pending = True  # save the compiled artifacts after the first policy update of this run
         lr_ratio = 1.0
         command = self.env.unwrapped.command_manager.get_term(self.command_name)
         if not self.disable_logs:
@@ -143,7 +224,7 @@ class SuperMimicRunner(OnPolicyRunner):
             self._checkpoint_and_eval(final=True)
             return
         if self.compile_cache.load() and not self.disable_logs:
-            print(f"[compile] loaded cached artifacts {self.compile_cache.path}", flush=True)
+            print(f"[compile] loaded cached artifacts {self.compile_cache.loaded}", flush=True)
         utd_acc = 0.0
         timers = {"sim": 0.0, "wm": 0.0, "policy": 0.0}
         agg: dict[str, float] = {}
@@ -166,7 +247,7 @@ class SuperMimicRunner(OnPolicyRunner):
             if hasattr(command, "set_failure_reset_active"):
                 command.set_failure_reset_active(
                     not command.cfg.failure_reset.activate_after_world_model_warmup
-                    or (self.num_updates >= self.wm_only_updates and self.env_steps >= self.warmup_env_steps)
+                    or (self.num_updates >= self.wm_only_updates and run_steps >= self.warmup_env_steps)
                 )
             # ---- collect one vectorised step
             t0 = time.perf_counter()
@@ -187,8 +268,9 @@ class SuperMimicRunner(OnPolicyRunner):
                 ep_ret[reset_ids] = 0
                 ep_len[reset_ids] = 0
             self.env_steps += 1
+            run_steps += 1
             timers["sim"] += time.perf_counter() - t0
-            if self.env_steps < self.warmup_env_steps:
+            if run_steps < self.warmup_env_steps:
                 continue
 
             # ---- updates at the configured update-to-data ratio
@@ -216,8 +298,10 @@ class SuperMimicRunner(OnPolicyRunner):
                 agg_n += 1
                 self.num_updates += 1
                 self.current_learning_iteration = self.num_updates
-                if self.num_updates == self.wm_only_updates + 1 and self.compile_cache.save() and not self.disable_logs:
-                    print(f"[compile] saved artifacts {self.compile_cache.path}", flush=True)
+                if cache_pending and self.num_updates > self.wm_only_updates:
+                    cache_pending = False
+                    if self.compile_cache.save() and not self.disable_logs:
+                        print(f"[compile] saved artifacts {self.compile_cache.path}", flush=True)
                 stop = self.budget_mode == "updates" and self.budget.reached(self.num_updates, 0.0)
 
                 if self.num_updates % self.log_interval == 0 or stop:
@@ -231,6 +315,8 @@ class SuperMimicRunner(OnPolicyRunner):
                     self._log(agg, agg_n, timers, ret_buf, len_buf, elapsed)
                     agg, agg_n = {}, 0
                     timers = {k: 0.0 for k in timers}
+                    # Every eval_interval_updates updates when set (also with an hour budget), else every eval_interval_minutes.
+                    by_updates = bool(self.eval_interval_updates and self.num_updates % self.eval_interval_updates == 0)
                     if self.budget_mode == "hours":
                         out_of_time, eval_due, progress = self._broadcast_values(
                             float(elapsed > budget_s),
@@ -239,11 +325,9 @@ class SuperMimicRunner(OnPolicyRunner):
                         )
                         lr_ratio = self._lr_ratio(progress)
                         stop = bool(out_of_time) or self.budget.reached(self.num_updates, 0.0)
-                        evaluate = bool(eval_due)
+                        evaluate = by_updates if self.eval_interval_updates else bool(eval_due)
                     else:
-                        evaluate = bool(
-                            self.eval_interval_updates and self.num_updates % self.eval_interval_updates == 0
-                        )
+                        evaluate = by_updates
                     if evaluate and not stop:
                         self._checkpoint_and_eval()
                         last_eval = time.time()
@@ -320,6 +404,12 @@ class SuperMimicRunner(OnPolicyRunner):
             f"allreduce ms/update wm/actor/critic {g('allreduce_ms/wm'):.0f}/{g('allreduce_ms/actor'):.0f}/{g('allreduce_ms/critic'):.0f}",
             flush=True,
         )
+        if "wm_object_nse_kstep" in agg:
+            print(
+                f"  object | wm nse8 {g('wm_object_nse_kstep'):.4f} | imag motion {g('imag_reward/object_motion'):.2e} "
+                f"relation {g('imag_reward/object_relation'):.2e}",
+                flush=True,
+            )
 
     # ------------------------------------------------------------------ evaluation
 
@@ -340,29 +430,64 @@ class SuperMimicRunner(OnPolicyRunner):
         action_term = env.action_manager.get_term("joint_pos")
         noise_std, action_term.noise_std = action_term.noise_std, 0.0
 
-        lengths = command.time_totals
+        # Motions may start their evaluation after frame 0 (HOI: the audited start of the interaction).
+        starts = command.lib.eval_start if getattr(command.lib, "has_objects", False) else torch.zeros_like(command.time_totals)
+        lengths = command.time_totals - starts
         motion_range = torch.argsort(lengths)[self.gpu_global_rank :: self.gpu_world_size]
         keys = self.eval_metric_keys
+        object_eval = hasattr(command, "object_evaluation")
+        object_failed = torch.zeros(len(motion_range), dtype=torch.bool, device=self.device)
+        object_keys = (
+            "object_max_pos_error", "object_max_rot_error", "object_motion_coverage", "object_fail_pos",
+            "object_fail_rot", "object_fail_coverage", "object_fail_lift", "robot_fail",
+        )  # fmt: skip
+        object_sums = torch.zeros(len(motion_range), len(object_keys), device=self.device)
         sums = torch.zeros(len(motion_range), len(keys), device=self.device)
         maxs = torch.zeros(len(motion_range), len(keys), device=self.device)
         steps = torch.clamp(lengths[motion_range], max=self.eval_max_steps or 10**9)
-        for i in range(0, len(motion_range), self.env.num_envs):
-            ids = motion_range[i : i + self.env.num_envs]
-            k = len(ids)
-            command.motion_ids[:k] = ids
-            command.motion_ids[k:] = ids[0]
+        if hasattr(command, "evaluation_chunks"):
+            # Environments hold different objects: a motion runs where its object is.
+            chunks = command.evaluation_chunks(motion_range)
+        else:
+            chunks = [
+                (torch.arange(i, min(i + self.env.num_envs, len(motion_range)), device=self.device),
+                 torch.arange(min(self.env.num_envs, len(motion_range) - i), device=self.device))
+                for i in range(0, len(motion_range), self.env.num_envs)
+            ]  # fmt: skip
+        for pos, slots in chunks:
+            pos = pos.to(self.device)
+            ids = motion_range[pos]
+            command.motion_ids[slots] = ids
+            if hasattr(command, "fill_evaluation"):
+                command.fill_evaluation(slots)
+            else:
+                command.motion_ids[len(ids) :] = ids[0]
             obs, _ = self.env.reset()
-            limit = steps[i : i + k]
+            limit = steps[pos]
+            if object_eval:
+                command.reset_object_evaluation()
             for t in range(int(limit.max())):
+                if object_eval:
+                    command.eval_active[slots] = t < limit
                 obs, _, _, _ = self.env.step(self.policy.act_inference(obs.to(self.device)))
                 active = (t < limit)[:, None]
-                vals = torch.stack([command.metrics[key][:k] for key in keys], dim=-1)
-                sums[i : i + k] += vals * active
-                maxs[i : i + k] = torch.where(active, torch.maximum(maxs[i : i + k], vals), maxs[i : i + k])
+                vals = torch.stack([command.metrics[key][slots] for key in keys], dim=-1)
+                sums[pos] += vals * active
+                maxs[pos] = torch.where(active, torch.maximum(maxs[pos], vals), maxs[pos])
+            if object_eval:
+                f, m = command.object_evaluation(slots)
+                object_failed[pos] = f
+                object_sums[pos, :-1] = torch.stack([m[key] for key in object_keys[:-1]], -1)
         means = sums / steps[:, None]
         failed = torch.zeros(len(motion_range), dtype=torch.bool, device=self.device)
         for key, thr in self.success_metric_dict.items():
             failed |= maxs[:, keys.index(key)] > thr
+        if object_eval:
+            object_sums[:, object_keys.index("robot_fail")] = failed.float()
+        failed |= object_failed
+        has_object = (
+            command.lib.object_valid[motion_range] if object_eval else torch.zeros_like(failed)
+        )
 
         # Aggregate over ranks, overall and per dataset (motion-name prefix before '/').
         names = command.motion_names
@@ -370,12 +495,16 @@ class SuperMimicRunner(OnPolicyRunner):
         group_of = torch.tensor(
             [groups.index(names[j].split("/")[0]) for j in motion_range.tolist()], device=self.device
         )
-        table = torch.zeros(len(groups) + 1, 2 + len(keys), dtype=torch.float64, device=self.device)
+        n_obj = len(object_keys) if object_eval else 0
+        table = torch.zeros(len(groups) + 1, 3 + len(keys) + n_obj, dtype=torch.float64, device=self.device)
         for gi in range(len(groups) + 1):
             sel = torch.ones_like(failed) if gi == len(groups) else group_of == gi
             table[gi, 0] = sel.sum()
             table[gi, 1] = (~failed & sel).sum()
-            table[gi, 2:] = means[sel].sum(0)
+            table[gi, 2 : 2 + len(keys)] = means[sel].sum(0)
+            if n_obj:
+                table[gi, 2 + len(keys)] = (has_object & sel).sum()
+                table[gi, 3 + len(keys) :] = object_sums[has_object & sel].sum(0)
         table = self._allreduce_sum(table)
         out = {}
         for gi, gname in enumerate(groups + ["all"]):
@@ -386,6 +515,10 @@ class SuperMimicRunner(OnPolicyRunner):
             out[f"{prefix}success_rate"] = float(table[gi, 1]) / n
             for j, key in enumerate(keys):
                 out[f"{prefix}{key}"] = float(table[gi, 2 + j]) / n
+            n_with_object = float(table[gi, 2 + len(keys)]) if n_obj else 0.0
+            for j, key in enumerate(object_keys[:n_obj]):
+                if n_with_object > 0:
+                    out[f"{prefix}{key}"] = float(table[gi, 3 + len(keys) + j]) / n_with_object
 
         action_term.noise_std = noise_std
         self._set_env_no_evaluating(test_set=True)

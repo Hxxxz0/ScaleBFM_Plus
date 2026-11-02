@@ -19,6 +19,10 @@ COM_BODY = "torso_link"
 MASS_BODIES = ("left_wrist_yaw_link", "right_wrist_yaw_link")
 XI_DIM = 4 + 29 + 3 + 2
 
+
+def xi_dim(num_joints: int = 29) -> int:
+    return 4 + num_joints + 3 + 2
+
 # Normalisation (centre, half range) matching the event ranges of tracking_env_cfg.EventCfg.
 XI_OFFSET = [0.95, 0.75, 0.95, 0.75] + [0.0] * 29 + [0.0] * 3 + [0.5, 0.5]
 XI_SCALE = [0.65, 0.45, 0.65, 0.45] + [0.01] * 29 + [0.025, 0.05, 0.05] + [0.5, 0.5]
@@ -53,6 +57,7 @@ def read_sim_context(robot, device) -> torch.Tensor:
 
 
 def normalize_xi(xi: torch.Tensor) -> torch.Tensor:
-    offset = torch.tensor(XI_OFFSET, device=xi.device, dtype=xi.dtype)
-    scale = torch.tensor(XI_SCALE, device=xi.device, dtype=xi.dtype)
+    nj = xi.shape[-1] - 9
+    offset = torch.tensor(XI_OFFSET[:4] + [0.0] * nj + XI_OFFSET[-5:], device=xi.device, dtype=xi.dtype)
+    scale = torch.tensor(XI_SCALE[:4] + [0.01] * nj + XI_SCALE[-5:], device=xi.device, dtype=xi.dtype)
     return (xi - offset) / scale

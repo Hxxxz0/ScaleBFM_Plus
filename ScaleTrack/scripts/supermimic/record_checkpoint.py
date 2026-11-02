@@ -12,6 +12,8 @@ from isaaclab.app import AppLauncher
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--checkpoint", required=True)
+parser.add_argument("--task", default="G1-BFM-Transformer-Tracking-SuperMimic")
+parser.add_argument("--label", default="SuperMimic")
 parser.add_argument("--motion_lib_dir", required=True)
 parser.add_argument("--output_dir", required=True)
 parser.add_argument("--motion_ids", type=int, nargs="+", default=[233, 2116, 2550, 2524, 2500])
@@ -19,6 +21,7 @@ parser.add_argument("--max_seconds", type=float, default=20.0)
 parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--width", type=int, default=960)
 parser.add_argument("--height", type=int, default=720)
+parser.add_argument("--object_id", type=int, default=-1, help="multi-object libraries: the object of the environment")
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 args.enable_cameras = True
@@ -57,12 +60,16 @@ def sha256(path):
 def main():
     torch.set_num_threads(4)
     torch.manual_seed(args.seed)
-    task = "G1-BFM-Transformer-Tracking-SuperMimic"
+    task = args.task
     cfg = parse_env_cfg(task, device=args.device, num_envs=1)
     cfg.seed = args.seed
     cfg.commands.motion.motion_lib_dir = args.motion_lib_dir
     cfg.commands.motion.test_motion_lib_dir = ""
     cfg.commands.motion.shard_across_ranks = False
+    if hasattr(cfg.commands.motion, "group_mass"):
+        cfg.commands.motion.group_mass = {}  # sampling shares are irrelevant for recording
+    if args.object_id >= 0:
+        cfg.object_allocation = [args.object_id]  # the single environment holds the recorded motions' object
     cfg.viewer.origin_type = "world"
     cfg.viewer.resolution = (args.width, args.height)
     cfg.viewer.eye = (2.8, -2.8, 1.9)
@@ -79,8 +86,10 @@ def main():
     base.action_manager.get_term("joint_pos").noise_std = 0.0
     train_cfg = load_cfg_from_registry(task, "rsl_rl_cfg_entry_point").to_dict()
     obs = env.get_observations()
-    for name, shape in train_cfg["supermimic"]["ppo_critic_obs_shapes"].items():
-        obs[name] = torch.zeros(obs.batch_size[0], *shape, device=obs.device)
+    critic_shapes = train_cfg["supermimic"]["ppo_critic_obs_shapes"] if "supermimic" in train_cfg else {}
+    for name, shape in critic_shapes.items():
+        if name not in obs:
+            obs[name] = torch.zeros(obs.batch_size[0], *shape, device=obs.device)
     train_cfg["obs_groups"] = resolve_obs_groups(obs, train_cfg["obs_groups"], ["critic"])
     policy_cfg = dict(train_cfg["policy"])
     policy_cfg.pop("class_name")
@@ -98,6 +107,32 @@ def main():
         markers={"body": sim_utils.SphereCfg(radius=0.025, visual_material=sim_utils.PreviewSurfaceCfg(
             diffuse_color=(0.0, 0.9, 0.85), emissive_color=(0.0, 0.15, 0.14), roughness=0.7))},
     ))
+    hoi = hasattr(command, "object_reference")
+    if hoi:
+        # Reference object: cyan spheres on the 8 corners of the box (extreme hull points along its principal axes);
+        # the simulated box is painted orange.
+        meta = base.objects[args.object_id] if args.object_id >= 0 else base.object_meta
+        hull = torch.tensor(meta["hull_points"], device=args.device)
+        centered = hull - hull.mean(0)
+        axes = torch.linalg.eigh(centered.T @ centered).eigenvectors
+        signs = torch.tensor([[a, b, c] for a in (-1, 1) for b in (-1, 1) for c in (-1, 1)], device=args.device, dtype=hull.dtype)
+        corners = hull[(signs @ axes.T @ centered.T).argmax(-1)]
+        ref_box = VisualizationMarkers(VisualizationMarkersCfg(
+            prim_path="/Visuals/record_reference_object",
+            markers={"corner": sim_utils.SphereCfg(radius=0.03, visual_material=sim_utils.PreviewSurfaceCfg(
+                diffuse_color=(0.0, 0.9, 0.85), emissive_color=(0.0, 0.3, 0.28)))},
+        ))
+        sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.45, 0.08)).func(
+            "/World/Looks/record_object", sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.45, 0.08))
+        )
+        from isaaclab.sim.utils.prims import bind_visual_material
+        from pxr import Usd, UsdGeom
+
+        for prim in Usd.PrimRange(base.scene.stage.GetPrimAtPath("/World/envs/env_0/Object")):
+            if prim.IsA(UsdGeom.Mesh):
+                bind_visual_material(str(prim.GetPath()), "/World/Looks/record_object")
+        from isaaclab.utils.math import quat_apply
+        from scaletrack.tasks.tracking.supermimic.object_heads import object_errors
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     fps = round(1.0 / base.step_dt)
@@ -128,8 +163,9 @@ def main():
         policy.reset()
         command._update_metrics()
         # Avoid the end-of-motion automatic reset appearing in the video.
-        num_steps = min(int(command.time_totals[motion_id]) - 2, int(args.max_seconds * fps) - 1)
-        clip_path = output_dir / f"sm_{update}_{motion_id}_{name.split('/')[0]}.mp4"
+        start = int(command._evaluation_start(torch.tensor([0], device=args.device))) if hoi else 0
+        num_steps = min(int(command.time_totals[motion_id]) - 2 - start, int(args.max_seconds * fps) - 1)
+        clip_path = output_dir / f"sm_{update}_{motion_id}_{name.split('/')[-1][:40]}.mp4"
         encoder = subprocess.Popen([
             "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24",
             "-s", f"{args.width}x{args.height}", "-r", str(fps), "-i", "pipe:0", "-an",
@@ -150,6 +186,12 @@ def main():
                             raise RuntimeError(f"Unexpected automatic reset in motion {motion_id} at step {step}")
                         values.append([float(command.metrics[key][0]) for key in metric_keys])
                     reference.visualize(command.body_pos_w[0])
+                    if hoi:
+                        frame_ix = command._global_time_index()[:1]
+                        ref_obj = command.object_reference(frame_ix)
+                        ref_q = ref_obj[:, 3:7].expand(8, 4)
+                        ref_box.visualize(ref_obj[:, :3] + base.scene.env_origins[:1] + quat_apply(ref_q, corners))
+                        obj_err = object_errors(base.object_state()[:1], ref_obj)
                     center = 0.5 * (command.robot_anchor_pos_w[0, :2] + command.anchor_pos_w[0, :2])
                     camera_xy = 0.92 * camera_xy + 0.08 * center
                     x, y = camera_xy.tolist()
@@ -165,11 +207,15 @@ def main():
                 canvas = Image.fromarray(frame)
                 draw = ImageDraw.Draw(canvas)
                 draw.rectangle((0, 0, args.width, 99), fill=(20, 24, 30))
-                draw.text((16, 10), f"SuperMimic | update {update} | {name.split('/')[0]} | motion {motion_id}", font=font, fill="white")
+                draw.text((16, 10), f"{args.label} | update {update} | {name.split('/')[0]} | motion {motion_id}", font=font, fill="white")
                 short_name = name.split("/")[-1]
                 draw.text((16, 40), short_name[:92], font=small, fill=(210, 215, 222))
                 error = float(command.metrics["error_body_pos_g"][0])
-                draw.text((16, 68), f"t={step / fps:.2f}s   mean body global error={error:.3f}m   cyan dots: reference", font=small, fill=(70, 235, 220))
+                if hoi:
+                    draw.text((16, 68), f"t={step / fps:.2f}s  body err={error:.3f}m  box err={float(obj_err['position'][0]):.3f}m "
+                              f"{float(obj_err['rotation'][0]):.2f}rad   cyan: reference body / box corners, orange: box", font=small, fill=(70, 235, 220))
+                else:
+                    draw.text((16, 68), f"t={step / fps:.2f}s   mean body global error={error:.3f}m   cyan dots: reference", font=small, fill=(70, 235, 220))
                 encoder.stdin.write(np.asarray(canvas).tobytes())
                 if step % 100 == 0:
                     print(f"[record] motion={motion_id} step={step}/{num_steps} error={error:.3f}m", flush=True)

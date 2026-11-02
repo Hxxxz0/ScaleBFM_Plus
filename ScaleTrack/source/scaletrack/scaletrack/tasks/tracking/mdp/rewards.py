@@ -17,6 +17,14 @@ def _get_body_indexes(command: MotionCommand, body_names: list[str] | None) -> l
     return [i for i, name in enumerate(command.cfg.body_names) if (body_names is None) or (name in body_names)]
 
 
+def joint_pos_exp(env: ManagerBasedRLEnv, command_name: str, std: float, asset_cfg: SceneEntityCfg) -> torch.Tensor:
+    """Reference joint position tracking of a joint subset (e.g. the fingers): exp(-mean squared error / std^2)."""
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    ids = asset_cfg.joint_ids
+    error = torch.square(command.joint_pos[:, ids] - command.robot_joint_pos[:, ids]).mean(-1)
+    return torch.exp(-error / std**2)
+
+
 def global_body_height(env: ManagerBasedRLEnv, command_name: str, std: float) -> torch.Tensor:
     command: MotionCommand = env.command_manager.get_term(command_name)
     error = torch.square(command.anchor_pos_w[..., 2] - command.robot_anchor_pos_w[..., 2])
